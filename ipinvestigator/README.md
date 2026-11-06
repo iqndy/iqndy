@@ -14,32 +14,43 @@ Entrée : **une adresse IP**. Sortie : **un rapport HTML autonome** (capture d'�
 | Exposition déjà relevée | ports, noms d'hôte, CPE, CVE connues | Shodan InternetDB (gratuit, sans clé) |
 | Port 80 / 443 | état, réponse, redirections, titre, h1, serveur, technologies, cookies, formulaires, en-têtes de sécurité présents/absents, robots.txt, security.txt, certificat TLS, **capture d'écran** | scan direct + Chromium |
 
-## Installation (Windows)
+## Installation et utilisation (Windows)
 
-1. Installer Python 3.10+ depuis python.org (cocher *Add Python to PATH*).
-2. Double-cliquer sur `IPInvestigator.bat`, taper l'IP → le rapport s'ouvre dans le navigateur.
+1. Installer Python depuis python.org (cocher *Add Python to PATH*). Rien d'autre à installer.
+2. Double-cliquer sur **`IPInvestigator.bat`** : une page s'ouvre dans le navigateur.
+3. Saisir l'adresse IP → **Analyser** → l'avancement s'affiche, puis le rapport apparaît dans la page
+   (boutons : ouvrir en plein écran, télécharger le HTML / le JSON). Les rapports précédents restent listés.
 
-Au premier lancement, l'application installe automatiquement ce qui lui manque
-(modules Python, navigateur Chromium pour les captures, bases DB-IP) : cela prend quelques minutes, une seule fois.
-`installer.bat` permet de faire cette installation à l'avance, ou de mettre à jour les bases DB-IP (une fois par mois).
+Laisser la fenêtre noire ouverte pendant l'utilisation (c'est le serveur local).
 
-Installation manuelle (Windows / Linux / macOS) :
+Autres lanceurs :
+- `IPInvestigator-telephone.bat` : même interface, accessible aussi depuis un téléphone sur le même Wi-Fi
+  (l'adresse à taper sur le téléphone s'affiche dans la fenêtre).
+- `IPInvestigator-console.bat` : version texte, sans navigateur.
+
+### Dépendances
+
+Le programme fonctionne avec **la seule bibliothèque standard de Python** ; la capture d'écran utilise
+Microsoft Edge (ou Chrome) déjà installé. Au premier lancement, il tente d'ajouter des modules facultatifs
+(`requirements.txt`) si pypi.org est joignable — sinon il continue sans eux :
+
+| Module | Apport |
+|---|---|
+| beautifulsoup4 | analyse HTML plus fine |
+| maxminddb | géolocalisation via les bases DB-IP locales (en plus du service en ligne) |
+| cryptography | détail des certificats auto-signés |
+| playwright | captures via Playwright au lieu d'Edge/Chrome |
+
+Sur un réseau d'entreprise, si un proxy est configuré dans Windows, il est utilisé automatiquement pour les
+sources en ligne, et pour lire la page cible si la connexion directe est bloquée.
+
+### Ligne de commande
 
 ```bash
-pip install -r requirements.txt
-python ipinvestigator.py --setup          # Chromium + bases DB-IP
+python webapp.py [--lan] [--port 8765]
+python ipinvestigator.py 15.197.175.4 [-p 80,443,8080] [--no-screenshot] [--offline] [--no-open]
+python ipinvestigator.py --update-db      # bases DB-IP (si maxminddb est installé)
 ```
-
-## Utilisation
-
-```bash
-python ipinvestigator.py                    # demande l'IP
-python ipinvestigator.py 15.197.175.4
-python ipinvestigator.py 15.197.175.4 -p 80,443,8080,8443
-python ipinvestigator.py exemple.com        # un domaine est résolu en IP
-```
-
-Options : `--no-screenshot`, `--offline` (aucune API en ligne), `--no-open`, `-o DOSSIER`.
 
 Les rapports sont écrits dans `rapports/` (`<ip>-<date>.html` et `.json`), les captures dans `rapports/captures/`.
 Le HTML est autonome : on peut l'envoyer ou l'ouvrir sur un téléphone, la capture est intégrée.

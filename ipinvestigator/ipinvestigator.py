@@ -44,84 +44,103 @@ import webbrowser
 # Auto-installation des dépendances dans le Python qui exécute ce script
 # (évite les soucis quand plusieurs Python sont installés sous Windows)
 # --------------------------------------------------------------------------- #
-ESSENTIAL = {"requests": "requests", "bs4": "beautifulsoup4"}
-# Modules facultatifs : si l'un d'eux ne s'installe pas (ex. Python trop récent),
-# l'application fonctionne quand même avec la fonction correspondante dégradée.
-OPTIONAL = {"maxminddb": "maxminddb (bases de géolocalisation locales)",
-            "cryptography": "cryptography (détail du certificat TLS)",
-            "playwright": "playwright (captures d'écran ; repli sur Edge/Chrome installé)"}
+# Tous les modules externes sont FACULTATIFS : le programme fonctionne avec la seule
+# bibliothèque standard de Python. Ils ajoutent du confort s'ils sont installables.
+OPTIONAL = {"bs4": ("beautifulsoup4", "analyse HTML plus fine"),
+            "maxminddb": ("maxminddb", "bases de géolocalisation locales"),
+            "cryptography": ("cryptography", "détail des certificats auto-signés"),
+            "playwright": ("playwright", "captures via Playwright ; sinon Edge/Chrome")}
 _SKIP_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", ".install-skip.json")
+
+
+def _system_proxy() -> str | None:
+    """Proxy configuré dans Windows / variables d'environnement, s'il y en a un."""
+    import urllib.request
+    px = urllib.request.getproxies()
+    return px.get("https") or px.get("http")
+
+
+def _pypi_reachable() -> bool:
+    import urllib.request
+    try:
+        urllib.request.urlopen("https://pypi.org/simple/pip/", timeout=5).close()
+        return True
+    except Exception:  # noqa: BLE001
+        return False
 
 
 def _pip_install(pkg: str) -> bool:
     import subprocess
     cmd = [sys.executable, "-m", "pip", "install", "--disable-pip-version-check",
-           "--only-binary=:all:", "--prefer-binary", pkg]
+           "--only-binary=:all:", "--prefer-binary", "--retries", "1", "--timeout", "10", pkg]
+    px = _system_proxy()
+    if px:
+        cmd += ["--proxy", px]
     for extra in ([], ["--user"]):
         try:
-            if subprocess.call(cmd + extra, timeout=600) == 0:
+            if subprocess.call(cmd + extra, timeout=300) == 0:
                 return True
         except subprocess.TimeoutExpired:
             return False
     return False
 
 
+def _save_skip(mods: list[str]) -> None:
+    try:
+        os.makedirs(os.path.dirname(_SKIP_FILE), exist_ok=True)
+        with open(_SKIP_FILE, "w", encoding="utf-8") as fh:
+            json.dump({sys.executable: mods}, fh)
+    except OSError:
+        pass
+
+
 def bootstrap() -> None:
     import importlib
     import importlib.util
+    if os.environ.get("IPINV_NO_INSTALL"):
+        return
     try:
         with open(_SKIP_FILE, encoding="utf-8") as fh:
             skip = json.load(fh).get(sys.executable, [])
     except (OSError, ValueError):
         skip = []
-    todo = [(m, m if m != "bs4" else "beautifulsoup4", True) for m in ESSENTIAL
-            if importlib.util.find_spec(m) is None]
-    todo += [(m, m, False) for m in OPTIONAL
-             if importlib.util.find_spec(m) is None and m not in skip]
+    todo = [m for m in OPTIONAL if importlib.util.find_spec(m) is None and m not in skip]
     if not todo:
         return
-    print("Première utilisation : installation des modules nécessaires.")
-    print(f"Python utilisé : {sys.executable} ({sys.version.split()[0]})")
-    print("Cela peut prendre quelques minutes, ne fermez pas la fenêtre.\n", flush=True)
+    print("Installation des modules complémentaires (facultatifs) …", flush=True)
+    if not _pypi_reachable():
+        print("  pypi.org injoignable depuis ce réseau (pare-feu / proxy d'entreprise) :")
+        print("  l'application fonctionne quand même, sans ces modules.\n", flush=True)
+        _save_skip(skip + todo)
+        return
     if importlib.util.find_spec("pip") is None:
         import subprocess
-        print("  → installation de pip …", flush=True)
         subprocess.call([sys.executable, "-m", "ensurepip", "--upgrade"])
-    failed_opt = []
-    for mod, pkg, essential in todo:
-        print(f"  → {pkg} …", flush=True)
-        if _pip_install(pkg):
-            continue
-        if essential:
-            print(f"\nImpossible d'installer « {pkg} », indispensable au programme.")
-            print("Installez Python 3.12 ou 3.13 depuis python.org puis relancez.")
-            input("Appuyez sur Entrée pour quitter…")
-            sys.exit(1)
-        print(f"    (non disponible pour ce Python : {OPTIONAL[mod]} désactivé)", flush=True)
-        failed_opt.append(mod)
-    if failed_opt:  # on ne réessaie pas à chaque lancement
-        try:
-            os.makedirs(os.path.dirname(_SKIP_FILE), exist_ok=True)
-            with open(_SKIP_FILE, "w", encoding="utf-8") as fh:
-                json.dump({sys.executable: skip + failed_opt}, fh)
-        except OSError:
-            pass
+    failed = []
+    for mod in todo:
+        pkg, what = OPTIONAL[mod]
+        print(f"  → {pkg} ({what}) …", flush=True)
+        if not _pip_install(pkg):
+            print("    non disponible, ignoré.", flush=True)
+            failed.append(mod)
+    if failed:
+        _save_skip(skip + failed)
     importlib.invalidate_caches()
     import site
-    try:  # rend visibles les paquets installés avec --user sans redémarrer
+    try:
         if site.getusersitepackages() not in sys.path:
             sys.path.append(site.getusersitepackages())
     except Exception:  # noqa: BLE001
         pass
-    print("\nInstallation terminée.\n", flush=True)
+    print(flush=True)
 
 
 bootstrap()
 
-import requests  # noqa: E402
-import urllib3  # noqa: E402
-
-urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+import http.cookiejar  # noqa: E402
+import urllib.error  # noqa: E402
+import urllib.parse  # noqa: E402
+import urllib.request  # noqa: E402
 
 try:
     from bs4 import BeautifulSoup
@@ -209,8 +228,21 @@ TECH_PATTERNS = [
 # --------------------------------------------------------------------------- #
 # Utilitaires
 # --------------------------------------------------------------------------- #
+import threading  # noqa: E402
+
+_log_local = threading.local()
+
+
 def log(msg: str) -> None:
+    """Affiche une étape ; l'interface web peut capter ces messages par thread."""
+    sink = getattr(_log_local, "sink", None)
+    if sink is not None:
+        sink(msg)
     print(f"  [*] {msg}", flush=True)
+
+
+def set_log_sink(fn) -> None:
+    _log_local.sink = fn
 
 
 def safe(fn, *a, **kw):
@@ -221,12 +253,80 @@ def safe(fn, *a, **kw):
         return {"_error": f"{type(exc).__name__}: {exc}"}
 
 
+class HttpError(Exception):
+    pass
+
+
+class Resp:
+    def __init__(self, status, reason, url, headers, content, history, jar):
+        self.status, self.reason, self.url = status, reason, url
+        self.headers, self.content, self.history, self.jar = headers, content, history, jar
+
+    @property
+    def text(self) -> str:
+        ct = self.headers.get("content-type", "") if isinstance(self.headers, dict) else ""
+        m = re.search(r"charset=([\w.-]+)", ct, re.I)
+        try:
+            return self.content.decode(m.group(1) if m else "utf-8", errors="replace")
+        except LookupError:
+            return self.content.decode("utf-8", errors="replace")
+
+    def json(self):
+        return json.loads(self.content.decode("utf-8", errors="replace"))
+
+
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, *a, **kw):
+        return None
+
+
+_INSECURE = ssl.create_default_context()
+_INSECURE.check_hostname = False
+_INSECURE.verify_mode = ssl.CERT_NONE
+
+
+def fetch(url: str, timeout: float = TIMEOUT, verify: bool = True, direct: bool = False,
+          headers: dict | None = None, jar=None, max_bytes: int = 5_000_000,
+          max_redirects: int = 10) -> Resp:
+    """GET avec suivi des redirections et cookies (bibliothèque standard uniquement).
+    direct=True : connexion directe à la cible, sans le proxy du système."""
+    jar = jar if jar is not None else http.cookiejar.CookieJar()
+    hdrs = {"User-Agent": UA, "Accept-Language": "fr,en;q=0.8", "Accept": "*/*"}
+    hdrs.update(headers or {})
+    handlers = [_NoRedirect(), urllib.request.HTTPCookieProcessor(jar),
+                urllib.request.HTTPSHandler(context=None if verify else _INSECURE)]
+    if direct:
+        handlers.append(urllib.request.ProxyHandler({}))
+    opener = urllib.request.build_opener(*handlers)
+    history = []
+    for _ in range(max_redirects + 1):
+        req = urllib.request.Request(url, headers=hdrs)
+        try:
+            resp = opener.open(req, timeout=timeout)
+        except urllib.error.HTTPError as e:
+            resp = e
+        status = resp.status if hasattr(resp, "status") else resp.code
+        reason = getattr(resp, "reason", "") or ""
+        rh = {k: v for k, v in resp.headers.items()}
+        body = resp.read(max_bytes) or b""
+        resp.close()
+        loc = resp.headers.get("Location")
+        if status in (301, 302, 303, 307, 308) and loc:
+            nxt = urllib.parse.urljoin(url, loc)
+            history.append(f"{status} → {nxt}")
+            url = nxt
+            continue
+        return Resp(status, reason, url, rh, body, history, jar)
+    raise HttpError("trop de redirections")
+
+
 def http_json(url: str, timeout: int = TIMEOUT):
-    r = requests.get(url, timeout=timeout, headers={"User-Agent": f"{APP}/{VERSION}",
-                                                    "Accept": "application/json"})
-    if r.status_code == 404:
+    r = fetch(url, timeout=timeout, headers={"User-Agent": f"{APP}/{VERSION}",
+                                             "Accept": "application/json"})
+    if r.status == 404:
         return {"_error": "aucune donnée (404)"}
-    r.raise_for_status()
+    if r.status >= 400:
+        raise HttpError(f"HTTP {r.status} {r.reason}")
     return r.json()
 
 
@@ -291,7 +391,27 @@ def tls_info(ip: str, port: int = 443, sni: str | None = None) -> dict:
         except x509.ExtensionNotFound:
             info["san"] = []
     except ImportError:
-        info["note"] = "installez 'cryptography' pour le détail du certificat"
+        # Sans 'cryptography' : le module ssl ne décode que les certificats valides
+        try:
+            vctx = ssl.create_default_context()
+            vctx.check_hostname = False
+            with socket.create_connection((ip, port), timeout=TIMEOUT) as sock:
+                with vctx.wrap_socket(sock, server_hostname=sni or None) as s:
+                    c = s.getpeercert()
+            fmt = lambda t: " ".join(f"{k}={v}" for rdn in t for k, v in rdn)  # noqa: E731
+            info["subject"] = fmt(c.get("subject", ()))
+            info["issuer"] = fmt(c.get("issuer", ()))
+            nb = dt.datetime.utcfromtimestamp(ssl.cert_time_to_seconds(c["notBefore"]))
+            na = dt.datetime.utcfromtimestamp(ssl.cert_time_to_seconds(c["notAfter"]))
+            info["not_before"], info["not_after"] = nb.strftime("%Y-%m-%d"), na.strftime("%Y-%m-%d")
+            info["expired"] = na < dt.datetime.utcnow()
+            info["self_signed"] = False
+            info["san"] = [v for k, v in c.get("subjectAltName", ()) if k == "DNS"]
+        except ssl.SSLCertVerificationError as exc:
+            info["note"] = f"certificat non reconnu ({exc.verify_message})"
+            info["self_signed"] = "self" in str(exc.verify_message).lower()
+        except Exception:  # noqa: BLE001
+            info["note"] = "détail du certificat indisponible"
     return info
 
 
@@ -338,26 +458,27 @@ def parse_html(body: str) -> dict:
     return out
 
 
-def http_probe(ip: str, port: int) -> dict:
+def http_probe(ip: str, port: int, via_proxy: bool = False) -> dict:
     scheme = "https" if port in (443, 8443) else "http"
     host = ip if port in (80, 443) else f"{ip}:{port}"
     url = f"{scheme}://{host}/"
     res: dict = {"url": url}
-    s = requests.Session()
-    s.headers.update({"User-Agent": UA, "Accept-Language": "fr,en;q=0.8"})
-    r = s.get(url, timeout=TIMEOUT, verify=False, allow_redirects=True)
-    res["status"] = r.status_code
+    jar = http.cookiejar.CookieJar()
+    r = fetch(url, verify=False, direct=not via_proxy, jar=jar)
+    if via_proxy:
+        res["via_proxy"] = True
+    res["status"] = r.status
     res["reason"] = r.reason
     res["final_url"] = r.url
-    res["redirects"] = [f"{h.status_code} → {h.headers.get('Location', '')}" for h in r.history]
-    res["headers"] = dict(r.headers)
+    res["redirects"] = r.history
+    res["headers"] = r.headers
     hl = {k.lower(): v for k, v in r.headers.items()}
     res["server"] = hl.get("server")
     res["powered_by"] = hl.get("x-powered-by")
     res["content_type"] = hl.get("content-type")
     res["size"] = len(r.content)
     cookies = []
-    for c in r.cookies:
+    for c in jar:
         flags = []
         if c.secure:
             flags.append("Secure")
@@ -367,11 +488,13 @@ def http_probe(ip: str, port: int) -> dict:
         if ss:
             flags.append(f"SameSite={ss}")
         cookies.append({"name": c.name, "domain": c.domain, "flags": flags})
-    # cookies posées pendant les redirections
-    for h in r.history:
-        for c in h.cookies:
-            if c.name not in [x["name"] for x in cookies]:
-                cookies.append({"name": c.name, "domain": c.domain, "flags": []})
+    # cookies refusées par la politique de domaine (cible = IP) : lecture brute des en-têtes
+    for k, v in r.headers.items():
+        if k.lower() == "set-cookie":
+            name = v.split("=", 1)[0].strip()
+            if name and name not in [x["name"] for x in cookies]:
+                fl = [f for f in ("Secure", "HttpOnly") if re.search(rf";\s*{f}\b", v, re.I)]
+                cookies.append({"name": name, "domain": "", "flags": fl})
     res["cookies"] = cookies
     body = r.text if "html" in (res["content_type"] or "html") else ""
     res.update(parse_html(body))
@@ -381,10 +504,11 @@ def http_probe(ip: str, port: int) -> dict:
     # robots.txt / security.txt
     for path, key in (("/robots.txt", "robots"), ("/.well-known/security.txt", "security_txt")):
         try:
-            rr = s.get(f"{scheme}://{host}{path}", timeout=TIMEOUT, verify=False)
-            ok = rr.status_code == 200 and "<html" not in rr.text[:300].lower()
+            rr = fetch(f"{scheme}://{host}{path}", verify=False, direct=not via_proxy, jar=jar,
+                       max_bytes=20000)
+            ok = rr.status == 200 and "<html" not in rr.text[:300].lower()
             res[key] = rr.text[:3000] if ok and rr.text.strip() else None
-        except requests.RequestException:
+        except Exception:  # noqa: BLE001
             res[key] = None
     if scheme == "https":
         res["tls"] = safe(tls_info, ip, port)
@@ -749,9 +873,23 @@ def investigate(ip: str, ports: list[int], out_dir: str, do_shot: bool = True,
             log(f"Port {p} : {r['scan'][p]['state']}")
         log("Analyse HTTP/HTTPS …" if open_ports else "Aucun port web ouvert.")
         f_http = {p: ex.submit(safe, http_probe, ip, p) for p in open_ports}
+        # Réseau d'entreprise : connexion directe bloquée mais proxy disponible
+        if not offline and _system_proxy():
+            for p in ports:
+                if p not in open_ports:
+                    f_http[p] = ex.submit(safe, http_probe, ip, p, True)
         asn = pick((r["geo_local"] or {}).get("asn"), (r["geo_online"] or {}).get("asn"))
         f_pdb = ex.submit(safe, peeringdb, int(asn)) if (asn and not offline) else None
         r["http"] = {p: f.result() for p, f in f_http.items()}
+        for p in list(r["http"]):
+            if p in open_ports:
+                continue
+            if ok(r["http"][p]):  # joignable seulement via le proxy du système
+                r["scan"][p]["state"] = "ouvert"
+                r["scan"][p]["note"] = "connexion directe bloquée, page lue via le proxy"
+                log(f"Port {p} : joignable via le proxy du réseau")
+            else:
+                del r["http"][p]
         r["peeringdb"] = f_pdb.result() if f_pdb else {"_error": "ASN inconnu" if not offline else "mode hors-ligne"}
 
     r["screenshots"] = {}
@@ -858,7 +996,7 @@ def render_html(r: dict) -> str:
         ("Noms d'hôte", "<br>".join(html.escape(h) for h in s["hostnames"]),
          "DNS inverse ; Shodan InternetDB"),
         ("Contact abus", E(s["abuse"]), "RDAP"),
-        ("Capture", shot_cell, "navigateur sans interface, Chromium"),
+        ("Capture", shot_cell, "navigateur sans interface (Edge, Chrome ou Chromium)"),
     ]
 
     # ---------- Adresse ----------
@@ -1123,25 +1261,56 @@ def update_db() -> None:
             url = f"https://download.db-ip.com/free/dbip-{kind}-lite-{m}.mmdb.gz"
             print(f"Téléchargement {url}")
             try:
-                rr = requests.get(url, timeout=120, stream=True)
-                if rr.status_code != 200:
-                    print(f"  → HTTP {rr.status_code}")
-                    continue
+                req = urllib.request.Request(url, headers={"User-Agent": f"{APP}/{VERSION}"})
+                rr = urllib.request.urlopen(req, timeout=30)
                 dest = os.path.join(DATA_DIR, f"dbip-{kind}-lite-{m}.mmdb")
-                with gzip.GzipFile(fileobj=rr.raw) as gz, open(dest, "wb") as fh:
+                with gzip.GzipFile(fileobj=rr) as gz, open(dest + ".part", "wb") as fh:
                     shutil.copyfileobj(gz, fh)
+                os.replace(dest + ".part", dest)
                 for old in glob.glob(os.path.join(DATA_DIR, f"dbip-{kind}-lite-*.mmdb")):
                     if old != dest:
                         os.remove(old)
                 print(f"  → {dest}")
                 break
-            except requests.RequestException as exc:
+            except Exception as exc:  # noqa: BLE001
                 print(f"  → échec : {exc}")
 
 
 # --------------------------------------------------------------------------- #
 # CLI
 # --------------------------------------------------------------------------- #
+def ensure_db() -> None:
+    if maxminddb and not (find_mmdb("city") and find_mmdb("asn")):
+        print("Bases de géolocalisation DB-IP absentes : téléchargement (une seule fois) …")
+        update_db()
+
+
+def save_report(r: dict, out_dir: str) -> str:
+    """Écrit <ip>-<date>.html et .json ; renvoie le chemin sans extension."""
+    os.makedirs(out_dir, exist_ok=True)
+    base = os.path.join(out_dir, f"{r['ip']}-{r['stamp']}")
+    with open(base + ".html", "w", encoding="utf-8") as fh:
+        fh.write(render_html(r))
+    raw = dict(r)
+    raw["screenshots"] = {p: {k: v for k, v in sc.items() if k != "b64"}
+                          for p, sc in r["screenshots"].items()}
+    with open(base + ".json", "w", encoding="utf-8") as fh:
+        json.dump(raw, fh, indent=2, ensure_ascii=False, default=str)
+    return base
+
+
+def parse_ports(text: str) -> list[int]:
+    ports = []
+    for x in re.split(r"[,;\s]+", str(text or "")):
+        if x.strip():
+            p = int(x)
+            if not 1 <= p <= 65535:
+                raise ValueError(f"port invalide : {p}")
+            if p not in ports:
+                ports.append(p)
+    return ports or [80, 443]
+
+
 def resolve_target(target: str) -> str:
     target = target.strip()
     target = re.sub(r"^\w+://", "", target).split("/")[0]
@@ -1175,9 +1344,8 @@ def main(argv=None) -> int:
         update_db()
         if not a.ip:
             return 0
-    if not a.offline and maxminddb and not (find_mmdb("city") and find_mmdb("asn")):
-        print("Bases de géolocalisation DB-IP absentes : téléchargement (une seule fois) …")
-        update_db()
+    if not a.offline:
+        ensure_db()
 
     print(f"\n=== {APP} {VERSION} ===")
     target = a.ip or input("Adresse IP à analyser : ")
@@ -1186,7 +1354,7 @@ def main(argv=None) -> int:
     except (OSError, ValueError):
         print(f"Adresse invalide : {target!r}")
         return 2
-    ports = [int(x) for x in re.split(r"[,\s]+", a.ports) if x.strip()]
+    ports = parse_ports(a.ports)
     ipobj = ipaddress.ip_address(ip)
     if ipobj.is_private or ipobj.is_loopback:
         print("  (adresse privée : les sources Internet ne renverront rien d'utile)")
@@ -1194,13 +1362,7 @@ def main(argv=None) -> int:
     print(f"\nAnalyse de {ip}\n")
     r = investigate(ip, ports, a.out, do_shot=not a.no_screenshot, offline=a.offline)
 
-    base = os.path.join(a.out, f"{ip}-{r['stamp']}")
-    with open(base + ".html", "w", encoding="utf-8") as fh:
-        fh.write(render_html(r))
-    raw = dict(r)
-    raw["screenshots"] = {p: {k: v for k, v in sc.items() if k != "b64"} for p, sc in r["screenshots"].items()}
-    with open(base + ".json", "w", encoding="utf-8") as fh:
-        json.dump(raw, fh, indent=2, ensure_ascii=False, default=str)
+    base = save_report(r, a.out)
 
     s = r["summary"]
     print(f"\n  Site        : {s['site_name'] or '—'}")
