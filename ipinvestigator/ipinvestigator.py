@@ -44,32 +44,68 @@ import webbrowser
 # Auto-installation des dépendances dans le Python qui exécute ce script
 # (évite les soucis quand plusieurs Python sont installés sous Windows)
 # --------------------------------------------------------------------------- #
-REQUIRED = {"requests": "requests", "bs4": "beautifulsoup4", "maxminddb": "maxminddb",
-            "cryptography": "cryptography", "playwright": "playwright"}
+ESSENTIAL = {"requests": "requests", "bs4": "beautifulsoup4"}
+# Modules facultatifs : si l'un d'eux ne s'installe pas (ex. Python trop récent),
+# l'application fonctionne quand même avec la fonction correspondante dégradée.
+OPTIONAL = {"maxminddb": "maxminddb (bases de géolocalisation locales)",
+            "cryptography": "cryptography (détail du certificat TLS)",
+            "playwright": "playwright (captures d'écran ; repli sur Edge/Chrome installé)"}
+_SKIP_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", ".install-skip.json")
 
 
-def _pip(*args) -> int:
+def _pip_install(pkg: str) -> bool:
     import subprocess
-    return subprocess.call([sys.executable, "-m", "pip", *args])
+    cmd = [sys.executable, "-m", "pip", "install", "--disable-pip-version-check",
+           "--only-binary=:all:", "--prefer-binary", pkg]
+    for extra in ([], ["--user"]):
+        try:
+            if subprocess.call(cmd + extra, timeout=600) == 0:
+                return True
+        except subprocess.TimeoutExpired:
+            return False
+    return False
 
 
 def bootstrap() -> None:
     import importlib
     import importlib.util
-    missing = [pkg for mod, pkg in REQUIRED.items() if importlib.util.find_spec(mod) is None]
-    if not missing:
+    try:
+        with open(_SKIP_FILE, encoding="utf-8") as fh:
+            skip = json.load(fh).get(sys.executable, [])
+    except (OSError, ValueError):
+        skip = []
+    todo = [(m, m if m != "bs4" else "beautifulsoup4", True) for m in ESSENTIAL
+            if importlib.util.find_spec(m) is None]
+    todo += [(m, m, False) for m in OPTIONAL
+             if importlib.util.find_spec(m) is None and m not in skip]
+    if not todo:
         return
-    print(f"Installation des modules manquants : {', '.join(missing)}")
-    print(f"(Python utilisé : {sys.executable})\n")
+    print("Première utilisation : installation des modules nécessaires.")
+    print(f"Python utilisé : {sys.executable} ({sys.version.split()[0]})")
+    print("Cela peut prendre quelques minutes, ne fermez pas la fenêtre.\n", flush=True)
     if importlib.util.find_spec("pip") is None:
         import subprocess
+        print("  → installation de pip …", flush=True)
         subprocess.call([sys.executable, "-m", "ensurepip", "--upgrade"])
-    base = ["install", "--disable-pip-version-check", *missing]
-    if _pip(*base) != 0 and _pip(*base, "--user") != 0:
-        print("\nÉchec de l'installation automatique. Essayez manuellement :")
-        print(f'  "{sys.executable}" -m pip install {" ".join(missing)}')
-        input("Appuyez sur Entrée pour quitter…")
-        sys.exit(1)
+    failed_opt = []
+    for mod, pkg, essential in todo:
+        print(f"  → {pkg} …", flush=True)
+        if _pip_install(pkg):
+            continue
+        if essential:
+            print(f"\nImpossible d'installer « {pkg} », indispensable au programme.")
+            print("Installez Python 3.12 ou 3.13 depuis python.org puis relancez.")
+            input("Appuyez sur Entrée pour quitter…")
+            sys.exit(1)
+        print(f"    (non disponible pour ce Python : {OPTIONAL[mod]} désactivé)", flush=True)
+        failed_opt.append(mod)
+    if failed_opt:  # on ne réessaie pas à chaque lancement
+        try:
+            os.makedirs(os.path.dirname(_SKIP_FILE), exist_ok=True)
+            with open(_SKIP_FILE, "w", encoding="utf-8") as fh:
+                json.dump({sys.executable: skip + failed_opt}, fh)
+        except OSError:
+            pass
     importlib.invalidate_caches()
     import site
     try:  # rend visibles les paquets installés avec --user sans redémarrer
@@ -77,7 +113,7 @@ def bootstrap() -> None:
             sys.path.append(site.getusersitepackages())
     except Exception:  # noqa: BLE001
         pass
-    print()
+    print("\nInstallation terminée.\n", flush=True)
 
 
 bootstrap()
@@ -362,24 +398,77 @@ def install_chromium() -> None:
     subprocess.call([sys.executable, "-m", "playwright", "install", "chromium"])
 
 
-def screenshot(url: str, path: str) -> dict:
-    try:
-        from playwright.sync_api import sync_playwright
-    except ImportError:
-        return {"_error": "Playwright non installé (pip install playwright && "
-                          "python -m playwright install chromium)"}
+def find_system_browser() -> str | None:
+    """Edge / Chrome / Chromium déjà installé sur la machine."""
+    cands = [os.environ.get("IPINV_CHROMIUM")]
+    if os.name == "nt":
+        for base in (os.environ.get("PROGRAMFILES(X86)"), os.environ.get("PROGRAMFILES"),
+                     os.environ.get("LOCALAPPDATA")):
+            if base:
+                cands += [os.path.join(base, r"Microsoft\Edge\Application\msedge.exe"),
+                          os.path.join(base, r"Google\Chrome\Application\chrome.exe")]
+    elif sys.platform == "darwin":
+        cands += ["/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+                  "/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge",
+                  "/Applications/Chromium.app/Contents/MacOS/Chromium"]
+    cands += [shutil.which(n) for n in ("google-chrome", "chromium", "chromium-browser",
+                                        "microsoft-edge", "msedge", "chrome")]
+    return next((c for c in cands if c and os.path.isfile(c)), None)
+
+
+def screenshot_cli(url: str, path: str) -> dict:
+    """Capture via le navigateur installé en mode headless (sans Playwright)."""
+    import subprocess
+    import tempfile
+    exe = find_system_browser()
+    if not exe:
+        return {"_error": "aucun navigateur Edge/Chrome trouvé pour la capture"}
+    with tempfile.TemporaryDirectory() as prof:
+        cmd = [exe, "--headless=new", "--disable-gpu", "--hide-scrollbars", "--no-first-run",
+               "--ignore-certificate-errors", f"--user-data-dir={prof}",
+               "--window-size=1366,850", "--virtual-time-budget=8000",
+               f"--user-agent={UA}", f"--screenshot={os.path.abspath(path)}", url]
+        if hasattr(os, "geteuid") and os.geteuid() == 0:
+            cmd.insert(1, "--no-sandbox")
+        if os.path.exists(path):
+            os.remove(path)
+        proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        import time
+        deadline, last = time.time() + 60, -1
+        while time.time() < deadline and proc.poll() is None:
+            time.sleep(0.5)
+            if os.path.exists(path):  # image écrite : on n'attend pas la fermeture
+                size = os.path.getsize(path)
+                if size and size == last:
+                    break
+                last = size
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait(10)
+    if not os.path.exists(path):
+        return {"_error": f"la capture via {os.path.basename(exe)} a échoué"}
+    return {"path": path, "via": os.path.basename(exe)}
+
+
+def screenshot_playwright(url: str, path: str) -> dict:
+    from playwright.sync_api import sync_playwright
     with sync_playwright() as p:
-        kw = {}
         exe = os.environ.get("IPINV_CHROMIUM")
-        if exe:
-            kw["executable_path"] = exe
-        try:
-            browser = p.chromium.launch(**kw)
-        except Exception as exc:  # noqa: BLE001 — navigateur pas encore téléchargé
-            if "playwright install" not in str(exc) and "Executable doesn't exist" not in str(exc):
-                raise
+        attempts = [{"executable_path": exe}] if exe else []
+        attempts += [{}, {"channel": "msedge"}, {"channel": "chrome"}]
+        browser, last = None, None
+        for kw in attempts:
+            try:
+                browser = p.chromium.launch(**kw)
+                break
+            except Exception as exc:  # noqa: BLE001
+                last = exc
+        if browser is None:
             install_chromium()
-            browser = p.chromium.launch(**kw)
+            try:
+                browser = p.chromium.launch()
+            except Exception:  # noqa: BLE001
+                raise last
         try:
             page = browser.new_page(ignore_https_errors=True,
                                     viewport={"width": 1366, "height": 850},
@@ -392,7 +481,18 @@ def screenshot(url: str, path: str) -> dict:
             page.screenshot(path=path, full_page=False)
         finally:
             browser.close()
-    return {"path": path}
+    return {"path": path, "via": "Playwright / Chromium"}
+
+
+def screenshot(url: str, path: str) -> dict:
+    try:
+        import playwright  # noqa: F401
+    except ImportError:
+        return screenshot_cli(url, path)
+    try:
+        return screenshot_playwright(url, path)
+    except Exception:  # noqa: BLE001
+        return screenshot_cli(url, path)
 
 
 # --------------------------------------------------------------------------- #
