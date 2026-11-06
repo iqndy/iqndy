@@ -648,7 +648,7 @@ def table(items, src_col=False, head=None) -> str:
 
 
 def lst(values) -> str:
-    values = [v for v in (values or []) if v not in (None, "")]
+    values = list(dict.fromkeys(v for v in (values or []) if v not in (None, "")))
     return ", ".join(html.escape(str(v)) for v in values) if values else ""
 
 
@@ -737,8 +737,9 @@ def render_html(r: dict) -> str:
         lieu = lst([d.get("city"), d.get("region"), d.get("country")])
         coord = f"{d.get('lat')}, {d.get('lon')}" if d.get("lat") is not None else ""
         oper = lst([f"AS{d['asn']}" if d.get("asn") else None, d.get("as_org")])
-        geo_rows.append(f"<tr><td>{src}</td><td>{lieu}</td><td>{html.escape(coord)}</td>"
-                        f"<td>{E(d.get('network'))}</td><td>{oper}</td></tr>")
+        geo_rows.append(f'<tr><td data-l="Source">{src}</td><td data-l="Lieu">{lieu}</td>'
+                        f'<td data-l="Coordonnées">{html.escape(coord)}</td>'
+                        f'<td data-l="Réseau">{E(d.get("network"))}</td><td data-l="Opérateur">{oper}</td></tr>')
     geo_tbl = ('<table class="grid"><thead><tr><th>Source</th><th>Lieu</th><th>Coordonnées</th>'
                '<th>Réseau</th><th>Opérateur</th></tr></thead><tbody>' + "".join(geo_rows)
                + "</tbody></table>")
@@ -915,7 +916,20 @@ img.shot{{max-width:100%;border:1px solid var(--line);border-radius:8px;display:
 a{{color:var(--accent)}}
 details summary{{cursor:pointer;color:var(--accent);margin-top:10px}}
 .note{{color:var(--muted);font-size:13px;margin-top:22px}}
-@media (max-width:600px){{table.kv th{{width:38%}} table.src3 td.src{{display:none}} .card{{padding:14px}}}}
+@media (max-width:700px){{
+.wrap{{padding:16px 12px 40px}} header h1{{font-size:26px}} .card{{padding:14px;border-radius:10px}}
+table.kv thead,table.grid thead{{display:none}}
+table.kv,table.kv tbody,table.kv tr,table.kv th,table.kv td,
+table.grid,table.grid tbody,table.grid tr,table.grid td{{display:block;width:auto!important}}
+table.kv tr,table.grid tr{{padding:10px 2px;border-bottom:1px solid var(--line)}}
+table.kv th,table.kv td,table.grid td{{border:0;padding:0;overflow-wrap:break-word;word-break:break-word}}
+table.kv th{{font-size:12px;font-weight:600;color:var(--muted);text-transform:uppercase;letter-spacing:.3px;margin-bottom:2px}}
+table.kv td{{font-size:15px}}
+table.src3 td.src{{font-size:12px;margin-top:3px}}
+table.src3 td.src::before{{content:"Source : "}}
+table.grid td{{font-size:14px;padding:1px 0}}
+table.grid td[data-l]::before{{content:attr(data-l) " : ";color:var(--muted);font-size:12px}}
+}}
 @media print{{details{{display:none}} .card{{break-inside:avoid}}}}
 </style></head><body><div class="wrap">
 <header><h1>{html.escape(ip)}</h1>
