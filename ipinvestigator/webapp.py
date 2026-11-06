@@ -62,6 +62,8 @@ def run_job(job: dict, target: str, ports: list[int], shot: bool) -> None:
                             "operator": " ".join(x for x in [f"AS{s['asn']}" if s["asn"] else "",
                                                              s["as_org"] or ""] if x),
                             "ports": {str(p): v["state"] for p, v in r["scan"].items()},
+                            "contact": " / ".join(x for x in [s.get("contact_email"),
+                                                              s.get("contact_phone")] if x),
                             "duration": r["duration_s"]})
         sink(f"Terminé en {r['duration_s']} s")
     except (OSError, ValueError) as exc:
@@ -370,6 +372,7 @@ function showReport(file, jsonFile, title, summary) {
   if (s.location !== undefined) cells.push(["Localisation", (s.location || "—") + (s.anycast ? ' <span class="badge warn">anycast</span>' : "")]);
   if (s.operator !== undefined) cells.push(["Opérateur", s.operator || "—"]);
   if (s.nature) cells.push(["Nature", s.nature]);
+  if (s.contact !== undefined) cells.push(["Contact du site", s.contact || "—"]);
   if (s.ports) cells.push(["Ports", Object.entries(s.ports).map(([p, st]) => p + " : " + st).join("<br>")]);
   $("sum").innerHTML = cells.map(([k, v]) => "<div><b>" + esc(k) + "</b>" + (k === "Localisation" || k === "Ports" ? v : esc(v)) + "</div>").join("");
   $("result").classList.remove("hidden");

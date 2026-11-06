@@ -849,6 +849,248 @@ def shodan_internetdb(ip: str) -> dict:
 
 
 # --------------------------------------------------------------------------- #
+# Contacts : site web, mentions légales, schema.org, security.txt, RDAP domaine
+# --------------------------------------------------------------------------- #
+CONTACT_KEYWORDS = re.compile(
+    r"contact|nous-?joindre|joindre|mentions|legal|l[ée]gales|impressum|imprint|a-?propos|about|"
+    r"support|aide|help|assistance|sav|service-?client|customer|status|statut|qui-sommes",
+    re.I)
+CONTACT_FALLBACK_PATHS = ["/contact", "/contact-us", "/nous-contacter", "/mentions-legales",
+                          "/legal", "/impressum", "/support", "/humans.txt"]
+SOCIAL = {"linkedin.com": "LinkedIn", "twitter.com": "X / Twitter", "x.com": "X / Twitter",
+          "facebook.com": "Facebook", "instagram.com": "Instagram", "youtube.com": "YouTube",
+          "github.com": "GitHub", "t.me": "Telegram", "wa.me": "WhatsApp", "tiktok.com": "TikTok"}
+_EMAIL_RX = re.compile(r"(?<![\w.+-])[A-Za-z0-9][\w.+-]{0,63}@[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)*\.[A-Za-z]{2,24}\b")
+_PHONE_RX = re.compile(
+    r"(?<![\w+])(?:\+33\s?\(?0?\)?\s?[1-9]|0[1-9])(?:[\s.\-]?\d{2}){4}(?!\d)"   # France
+    r"|(?<![\w+])\+\d{1,3}[\s.\-]?\(?\d{1,4}\)?(?:[\s.\-]?\d{2,4}){2,4}(?!\d)")  # international
+_BAD_EMAIL_END = (".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg", ".css", ".js", ".ico")
+
+
+def registered_domain(host: str | None) -> str | None:
+    if not host:
+        return None
+    host = host.lower().strip(".")
+    try:
+        ipaddress.ip_address(host)
+        return None
+    except ValueError:
+        pass
+    parts = host.split(".")
+    if len(parts) < 2:
+        return None
+    two = ".".join(parts[-2:])
+    if len(parts) >= 3 and (parts[-2] in ("co", "com", "net", "org", "gov", "gouv", "ac", "edu")
+                            or two in ("asso.fr", "nom.fr", "presse.fr")):
+        return ".".join(parts[-3:])
+    return two
+
+
+def _visible_text(body: str) -> str:
+    t = re.sub(r"(?is)<(script|style|noscript|svg)[^>]*>.*?</\1>", " ", body)
+    t = re.sub(r"(?s)<[^>]+>", " ", t)
+    t = html.unescape(t)
+    t = re.sub(r"\s*[\[\(\{]\s*(?:at|arobase)\s*[\]\)\}]\s*|\s+arobase\s+", "@", t, flags=re.I)
+    t = re.sub(r"\s*[\[\(\{]\s*(?:dot|point)\s*[\]\)\}]\s*", ".", t, flags=re.I)
+    return re.sub(r"\s+", " ", t)
+
+
+def _clean_email(e: str) -> str | None:
+    e = e.strip().strip(".").lower()
+    local = e.split("@")[0]
+    if e.endswith(_BAD_EMAIL_END) or len(local) > 40 or re.fullmatch(r"[0-9a-f]{16,}", local):
+        return None
+    if any(x in e for x in ("sentry", "wixpress", "@example.", "domain.com", "email.com", "@2x")):
+        return None
+    return e
+
+
+def _clean_phone(p: str) -> str | None:
+    digits = re.sub(r"\D", "", p)
+    if not 9 <= len(digits) <= 15 or len(set(digits)) <= 2:
+        return None
+    fr = digits[2:] if digits.startswith("33") and len(digits) == 11 else \
+        digits[3:] if digits.startswith("330") and len(digits) == 12 else None
+    if fr:  # +33 1 23 45 67 89
+        return "+33 " + fr[0] + " " + " ".join(fr[i:i + 2] for i in range(1, 9, 2))
+    if digits.startswith("0") and len(digits) == 10 and not p.strip().startswith("+"):
+        return " ".join(digits[i:i + 2] for i in range(0, 10, 2))
+    return re.sub(r"\s+", " ", p.strip())
+
+
+def _phone_key(p: str) -> str:
+    d = re.sub(r"\D", "", p)
+    if d.startswith("33") and len(d) == 11:
+        d = "0" + d[2:]
+    return d
+
+
+def _jsonld_contacts(body: str) -> list[dict]:
+    found = []
+
+    def walk(o, org=None):
+        if isinstance(o, list):
+            for x in o:
+                walk(x, org)
+        elif isinstance(o, dict):
+            name = o.get("name") if isinstance(o.get("name"), str) else org
+            for key, kind in (("email", "email"), ("telephone", "téléphone"), ("faxNumber", "fax")):
+                v = o.get(key)
+                for val in (v if isinstance(v, list) else [v]):
+                    if isinstance(val, str) and val.strip():
+                        found.append({"kind": kind, "value": val.replace("mailto:", "").strip(),
+                                      "label": o.get("contactType") or name})
+            adr = o.get("address")
+            if isinstance(adr, dict):
+                txt = ", ".join(str(adr[k]) for k in ("streetAddress", "postalCode", "addressLocality",
+                                                       "addressRegion", "addressCountry")
+                                if isinstance(adr.get(k), (str, int)))
+                if txt:
+                    found.append({"kind": "adresse", "value": txt, "label": name})
+            elif isinstance(adr, str) and adr.strip():
+                found.append({"kind": "adresse", "value": adr.strip(), "label": name})
+            for k, v in o.items():
+                if k != "address" and isinstance(v, (dict, list)):
+                    walk(v, name)
+
+    for m in re.finditer(r'(?is)<script[^>]+application/ld\+json[^>]*>(.*?)</script>', body):
+        try:
+            walk(json.loads(m.group(1).strip()))
+        except ValueError:
+            continue
+    return found
+
+
+def _extract_page_contacts(url: str, body: str) -> dict:
+    out = {"emails": set(), "phones": set(), "social": {}, "form": False, "jsonld": [],
+           "links": [], "title": None}
+    m = re.search(r"(?is)<title[^>]*>(.*?)</title>", body)
+    if m:
+        out["title"] = " ".join(html.unescape(m.group(1)).split())[:120]
+    for href in re.findall(r'(?i)href\s*=\s*["\']mailto:([^"\'?]+)', body):
+        e = _clean_email(urllib.parse.unquote(href))
+        if e:
+            out["emails"].add(e)
+    for href in re.findall(r'(?i)href\s*=\s*["\']tel:([^"\']+)', body):
+        p = _clean_phone(urllib.parse.unquote(href))
+        if p:
+            out["phones"].add(p)
+    text = _visible_text(body)
+    for e in _EMAIL_RX.findall(text):
+        e = _clean_email(e)
+        if e:
+            out["emails"].add(e)
+    for ph in _PHONE_RX.findall(text):
+        ph = _clean_phone(ph)
+        if ph:
+            out["phones"].add(ph)
+    for href, label in re.findall(r'(?is)<a\b[^>]*href\s*=\s*["\']([^"\'#]+)["\'][^>]*>(.*?)</a>', body):
+        absu = urllib.parse.urljoin(url, html.unescape(href.strip()))
+        host = urllib.parse.urlparse(absu).netloc.lower()
+        for dom, name in SOCIAL.items():
+            if host == dom or host.endswith("." + dom):
+                out["social"].setdefault(name, absu)
+        lab = " ".join(re.sub(r"<[^>]+>", " ", label).split())[:60]
+        if absu.startswith("http") and (CONTACT_KEYWORDS.search(urllib.parse.urlparse(absu).path)
+                                        or CONTACT_KEYWORDS.search(lab)):
+            out["links"].append((absu, lab))
+    out["form"] = bool(re.search(r"(?is)<form\b.*?<textarea", body))
+    out["jsonld"] = _jsonld_contacts(body)
+    return out
+
+
+def site_contacts(ip: str, h: dict) -> dict:
+    """Explore la page d'accueil et les pages contact / mentions légales du site."""
+    ctx = _LEGACY if h.get("legacy_tls") else _INSECURE
+    direct = not h.get("via_proxy")
+    pin = (h["sni"], ip) if h.get("sni") and direct else None
+    start = h.get("final_url") or h["url"]
+    origin = "{0.scheme}://{0.netloc}".format(urllib.parse.urlparse(start))
+    base_dom = registered_domain(urllib.parse.urlparse(start).hostname) or urllib.parse.urlparse(start).hostname
+
+    def get(u):
+        r = fetch(u, verify=False, direct=direct, context=ctx, pin=pin, timeout=6, max_bytes=2_000_000)
+        ct = r.headers.get("Content-Type", r.headers.get("content-type", ""))
+        if r.status != 200 or not ("html" in ct or "text" in ct or not ct):
+            return None
+        return r.url, r.text
+
+    pages = []
+    first = safe(get, start)
+    if isinstance(first, tuple):
+        pages.append((first[0], _extract_page_contacts(*first)))
+    # pages candidates : liens de la page d'accueil, puis chemins usuels
+    cand = []
+    if pages:
+        for u, lab in pages[0][1]["links"]:
+            hst = urllib.parse.urlparse(u).hostname or ""
+            if (registered_domain(hst) or hst) == base_dom and u.split("#")[0] not in cand:
+                cand.append(u.split("#")[0])
+    cand = cand[:6]
+    if len(cand) < 3:
+        cand += [origin + p for p in CONTACT_FALLBACK_PATHS if origin + p not in cand][:5]
+    with cf.ThreadPoolExecutor(max_workers=4) as ex:
+        for u, res in zip(cand, ex.map(lambda u: safe(get, u), cand)):
+            if isinstance(res, tuple) and res[0] not in [x[0] for x in pages]:
+                pages.append((res[0], _extract_page_contacts(*res)))
+
+    items, seen = [], set()
+
+    def add(kind, value, src, label=None):
+        if kind in ("téléphone", "fax"):
+            value = _clean_phone(value) or value
+            key = ("tel", _phone_key(value))
+        else:
+            key = (kind, value.lower().rstrip("/"))
+        if key in seen:
+            return
+        seen.add(key)
+        items.append({"kind": kind, "value": value, "source": src, "label": label})
+
+    for url, c in pages:
+        short = urllib.parse.urlparse(url).path or "/"
+        for j in c["jsonld"]:
+            add(j["kind"], j["value"], f"données structurées ({short})", j.get("label"))
+        for e in sorted(c["emails"]):
+            add("email", e, short)
+        for ph in sorted(c["phones"]):
+            add("téléphone", ph, short)
+        if c["form"]:
+            add("formulaire", url, short, c["title"])
+    social = {}
+    for _, c in pages:
+        for k, v in c["social"].items():
+            social.setdefault(k, v)
+    for k, v in social.items():
+        add("réseau social", v, "liens du site", k)
+    if h.get("security_txt"):
+        for line in h["security_txt"].splitlines():
+            m = re.match(r"\s*(Contact|Policy|Hiring)\s*:\s*(\S+)", line, re.I)
+            if m:
+                add("sécurité", m.group(2).replace("mailto:", ""), "/.well-known/security.txt",
+                    m.group(1).capitalize())
+    return {"origin": origin, "pages": [u for u, _ in pages], "items": items[:60]}
+
+
+def rdap_domain(domain: str) -> dict:
+    d = http_json(f"https://rdap.org/domain/{domain}", timeout=15)
+    out = {"domain": d.get("ldhName", domain).lower(), "status": d.get("status", []),
+           "nameservers": [n.get("ldhName", "").lower() for n in d.get("nameservers", [])]}
+    for ev in d.get("events", []):
+        a = ev.get("eventAction")
+        if a in ("registration", "expiration", "last changed"):
+            out[a.replace(" ", "_")] = (ev.get("eventDate") or "")[:10]
+    ents = _flatten_entities(d.get("entities"))
+    out["entities"] = ents
+    reg = next((e for e in ents if "registrar" in (e.get("roles") or [])), {})
+    out["registrar"] = reg.get("name")
+    out["registrar_url"] = next((l.get("href") for e in (d.get("entities") or [])
+                                 if "registrar" in (e.get("roles") or [])
+                                 for l in (e.get("links") or []) if l.get("href")), None)
+    return out
+
+
+# --------------------------------------------------------------------------- #
 # Synthèse / interprétation
 # --------------------------------------------------------------------------- #
 def ok(d) -> bool:
@@ -860,6 +1102,31 @@ def pick(*vals):
         if v not in (None, "", [], {}):
             return v
     return None
+
+
+def contact_summary(r: dict) -> dict:
+    """Meilleur contact par usage : site, sécurité, domaine, hébergeur."""
+    items = [it for c in r.get("contacts", {}).values() if ok(c) for it in c["items"]]
+
+    def best(kinds, prefer=r"contact|support|info|hello|bonjour|service|client|accueil|sav|help"):
+        cands = [it for it in items if it["kind"] in kinds]
+        cands.sort(key=lambda it: (not it["source"].startswith("données structurées"),
+                                   not re.search(prefer, it["value"], re.I)))
+        return cands[0]["value"] if cands else None
+
+    rd = r.get("rdap_domain") or {}
+    reg_abuse = None
+    if ok(rd):
+        for e in rd.get("entities", []):
+            if "abuse" in (e.get("roles") or []) and (e.get("emails") or e.get("phones")):
+                reg_abuse = (e.get("emails") or e.get("phones"))[0]
+                break
+    forms = [it["value"] for it in items if it["kind"] == "formulaire"]
+    return {"contact_email": best({"email"}), "contact_phone": best({"téléphone"}),
+            "contact_form": forms[0] if forms else None,
+            "contact_security": best({"sécurité"}, r"@|mailto"),
+            "contact_registrar": reg_abuse,
+            "registrar": rd.get("registrar") if ok(rd) else None}
 
 
 def analyse(r: dict) -> dict:
@@ -1021,7 +1288,34 @@ def investigate(ip: str, ports: list[int], out_dir: str, do_shot: bool = True,
                     res["b64"] = base64.b64encode(fh.read()).decode()
             r["screenshots"][p] = res
 
+    # ---------- Contacts ----------
+    log("Recherche des contacts (site, mentions légales, security.txt, RDAP domaine) …")
+    r["contacts"] = {}
+    origins = set()
+    for p, h in r["http"].items():
+        if not ok(h):
+            continue
+        origin = urllib.parse.urlparse(h.get("final_url") or h["url"]).netloc
+        if origin in origins:
+            continue
+        origins.add(origin)
+        r["contacts"][p] = safe(site_contacts, ip, h)
+    dom = hostname or next((h.get("sni") for h in r["http"].values() if ok(h) and h.get("sni")), None)
+    if not dom:
+        for h in r["http"].values():
+            if ok(h):
+                dom = urllib.parse.urlparse(h.get("final_url") or "").hostname
+                if registered_domain(dom):
+                    break
+    dom = registered_domain(dom)
+    r["domain"] = dom
+    if dom and not offline:
+        r["rdap_domain"] = safe(rdap_domain, dom)
+    else:
+        r["rdap_domain"] = {"_error": "aucun nom de domaine identifié" if not dom else "mode hors-ligne"}
+
     r["summary"] = analyse(r)
+    r["summary"].update(contact_summary(r))
     r["duration_s"] = round((now_utc() - started).total_seconds(), 1)
     return r
 
@@ -1064,6 +1358,74 @@ def err(d) -> str:
 
 def badge(text, kind="") -> str:
     return f'<span class="badge {kind}">{html.escape(text)}</span>'
+
+
+def contact_link(kind: str, value: str) -> str:
+    v = html.escape(value)
+    if kind in ("email", "sécurité") and "@" in value and not value.startswith("http"):
+        return f'<a href="mailto:{v}">{v}</a>'
+    if kind in ("téléphone", "fax"):
+        tel = re.sub(r"[^\d+]", "", value)
+        return f'<a href="tel:{html.escape(tel)}">{v}</a>'
+    if value.startswith("http"):
+        return f'<a href="{v}" target="_blank" rel="noopener">{v}</a>'
+    return v
+
+
+def render_contacts(r: dict) -> str:
+    s = r["summary"]
+    guide = [
+        ("Panne, question sur le site",
+         "<br>".join(x for x in [
+             contact_link("email", s["contact_email"]) if s.get("contact_email") else "",
+             contact_link("téléphone", s["contact_phone"]) if s.get("contact_phone") else "",
+             (f'formulaire : {contact_link("formulaire", s["contact_form"])}' if s.get("contact_form") else "")] if x),
+         "contacts publiés par le site"),
+        ("Faille de sécurité", contact_link("sécurité", s["contact_security"]) if s.get("contact_security") else "",
+         "security.txt"),
+        ("Abus, attaque, spam depuis cette IP", contact_link("email", s["abuse"]) if s.get("abuse") else "",
+         "hébergeur — RDAP de l'adresse IP"),
+        ("Problème lié au nom de domaine",
+         lst([s.get("registrar")]) + (("<br>" + contact_link("email", s["contact_registrar"]))
+                                      if s.get("contact_registrar") else ""),
+         "bureau d'enregistrement — RDAP du domaine"),
+    ]
+    out = ['<h4>Qui contacter ?</h4>' + table(guide, src_col=True, head=["Besoin", "Contact", "Source"])]
+    for p, c in r.get("contacts", {}).items():
+        if not ok(c):
+            out.append(f"<h4>Site (port {p})</h4>" + err(c))
+            continue
+        rows_ = "".join(
+            f'<tr><td data-l="Type">{html.escape(it["kind"])}</td>'
+            f'<td data-l="Coordonnée">{contact_link(it["kind"], it["value"])}</td>'
+            f'<td data-l="Libellé">{E(it.get("label"))}</td>'
+            f'<td data-l="Trouvé sur">{html.escape(it["source"])}</td></tr>' for it in c["items"])
+        body = ('<table class="grid"><thead><tr><th>Type</th><th>Coordonnée</th><th>Libellé</th>'
+                f'<th>Trouvé sur</th></tr></thead><tbody>{rows_}</tbody></table>') if rows_ else \
+            '<p class="na">Aucune coordonnée publiée trouvée sur les pages explorées.</p>'
+        pages = "".join(f"<li>{html.escape(u)}</li>" for u in c["pages"])
+        out.append(f'<h4>Coordonnées publiées par le site — {html.escape(c["origin"])}</h4>{body}'
+                   f'<details><summary>Pages explorées ({len(c["pages"])})</summary><ul class="small">{pages}</ul></details>')
+    rd = r.get("rdap_domain") or {}
+    if ok(rd):
+        items = [("Domaine", E(rd.get("domain"))), ("Bureau d'enregistrement", E(rd.get("registrar"))),
+                 ("Site du registrar", contact_link("url", rd["registrar_url"]) if rd.get("registrar_url") else ""),
+                 ("Création", E(rd.get("registration"))), ("Expiration", E(rd.get("expiration"))),
+                 ("Dernière modification", E(rd.get("last_changed"))),
+                 ("Serveurs DNS", "<br>".join(html.escape(n) for n in rd.get("nameservers", []))),
+                 ("Statut", lst(rd.get("status")))]
+        for e in rd.get("entities", []):
+            val = "<br>".join(x for x in [
+                f"<b>{html.escape(e['name'])}</b>" if e.get("name") else "",
+                html.escape(e["address"]) if e.get("address") else "",
+                "<br>".join(contact_link("email", m) for m in e.get("emails", [])),
+                "<br>".join(contact_link("téléphone", t) for t in e.get("phones", []))] if x)
+            if val:
+                items.append((", ".join(e.get("roles") or []) or "entité", val))
+        out.append(f"<h4>Nom de domaine (RDAP)</h4>{table(items)}")
+    else:
+        out.append(f'<h4>Nom de domaine (RDAP)</h4><p class="na">{html.escape(rd.get("_error", "—"))}</p>')
+    return "".join(out)
 
 
 def render_html(r: dict) -> str:
@@ -1347,6 +1709,8 @@ table.grid td[data-l]::before{{content:attr(data-l) " : ";color:var(--muted);fon
 
 <section class="card"><h2>Fiche d'identité</h2>
 {table(ident, src_col=True, head=["Champ", "Valeur", "Source"])}</section>
+
+<section class="card"><h2>Contacts</h2>{render_contacts(r)}</section>
 
 <section class="card"><h2>Adresse {html.escape(ip)}</h2>{table(addr)}
 <h4>Bases locales et sources de géolocalisation</h4>{geo_tbl}</section>
