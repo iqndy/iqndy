@@ -16,16 +16,18 @@ Entrée : **une adresse IP**. Sortie : **un rapport HTML autonome** (capture d'�
 
 ## Installation (Windows)
 
-1. Installer Python 3.10+ (cocher *Add Python to PATH*).
-2. Double-cliquer sur `installer.bat` (dépendances, Chromium, bases DB-IP).
-3. Double-cliquer sur `IPInvestigator.bat`, taper l'IP → le rapport s'ouvre dans le navigateur.
+1. Installer Python 3.10+ depuis python.org (cocher *Add Python to PATH*).
+2. Double-cliquer sur `IPInvestigator.bat`, taper l'IP → le rapport s'ouvre dans le navigateur.
+
+Au premier lancement, l'application installe automatiquement ce qui lui manque
+(modules Python, navigateur Chromium pour les captures, bases DB-IP) : cela prend quelques minutes, une seule fois.
+`installer.bat` permet de faire cette installation à l'avance, ou de mettre à jour les bases DB-IP (une fois par mois).
 
 Installation manuelle (Windows / Linux / macOS) :
 
 ```bash
 pip install -r requirements.txt
-python -m playwright install chromium
-python ipinvestigator.py --update-db      # bases DB-IP (à refaire chaque mois)
+python ipinvestigator.py --setup          # Chromium + bases DB-IP
 ```
 
 ## Utilisation

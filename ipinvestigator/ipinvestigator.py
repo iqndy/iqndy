@@ -40,13 +40,52 @@ import ssl
 import sys
 import webbrowser
 
-try:
-    import requests
-    import urllib3
+# --------------------------------------------------------------------------- #
+# Auto-installation des dépendances dans le Python qui exécute ce script
+# (évite les soucis quand plusieurs Python sont installés sous Windows)
+# --------------------------------------------------------------------------- #
+REQUIRED = {"requests": "requests", "bs4": "beautifulsoup4", "maxminddb": "maxminddb",
+            "cryptography": "cryptography", "playwright": "playwright"}
 
-    urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
-except ImportError:  # pragma: no cover
-    sys.exit("Le module 'requests' est requis : pip install -r requirements.txt")
+
+def _pip(*args) -> int:
+    import subprocess
+    return subprocess.call([sys.executable, "-m", "pip", *args])
+
+
+def bootstrap() -> None:
+    import importlib
+    import importlib.util
+    missing = [pkg for mod, pkg in REQUIRED.items() if importlib.util.find_spec(mod) is None]
+    if not missing:
+        return
+    print(f"Installation des modules manquants : {', '.join(missing)}")
+    print(f"(Python utilisé : {sys.executable})\n")
+    if importlib.util.find_spec("pip") is None:
+        import subprocess
+        subprocess.call([sys.executable, "-m", "ensurepip", "--upgrade"])
+    base = ["install", "--disable-pip-version-check", *missing]
+    if _pip(*base) != 0 and _pip(*base, "--user") != 0:
+        print("\nÉchec de l'installation automatique. Essayez manuellement :")
+        print(f'  "{sys.executable}" -m pip install {" ".join(missing)}')
+        input("Appuyez sur Entrée pour quitter…")
+        sys.exit(1)
+    importlib.invalidate_caches()
+    import site
+    try:  # rend visibles les paquets installés avec --user sans redémarrer
+        if site.getusersitepackages() not in sys.path:
+            sys.path.append(site.getusersitepackages())
+    except Exception:  # noqa: BLE001
+        pass
+    print()
+
+
+bootstrap()
+
+import requests  # noqa: E402
+import urllib3  # noqa: E402
+
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 try:
     from bs4 import BeautifulSoup
@@ -316,6 +355,13 @@ def http_probe(ip: str, port: int) -> dict:
     return res
 
 
+def install_chromium() -> None:
+    import subprocess
+    print("  [*] Téléchargement du navigateur Chromium pour les captures (une seule fois) …",
+          flush=True)
+    subprocess.call([sys.executable, "-m", "playwright", "install", "chromium"])
+
+
 def screenshot(url: str, path: str) -> dict:
     try:
         from playwright.sync_api import sync_playwright
@@ -327,7 +373,13 @@ def screenshot(url: str, path: str) -> dict:
         exe = os.environ.get("IPINV_CHROMIUM")
         if exe:
             kw["executable_path"] = exe
-        browser = p.chromium.launch(**kw)
+        try:
+            browser = p.chromium.launch(**kw)
+        except Exception as exc:  # noqa: BLE001 — navigateur pas encore téléchargé
+            if "playwright install" not in str(exc) and "Executable doesn't exist" not in str(exc):
+                raise
+            install_chromium()
+            browser = p.chromium.launch(**kw)
         try:
             page = browser.new_page(ignore_https_errors=True,
                                     viewport={"width": 1366, "height": 850},
@@ -1010,12 +1062,22 @@ def main(argv=None) -> int:
     ap.add_argument("--offline", action="store_true", help="pas de requête vers les API en ligne")
     ap.add_argument("--no-open", action="store_true", help="ne pas ouvrir le rapport à la fin")
     ap.add_argument("--update-db", action="store_true", help="télécharger les bases DB-IP lite")
+    ap.add_argument("--setup", action="store_true",
+                    help="installer le navigateur Chromium et les bases DB-IP")
     a = ap.parse_args(argv)
 
+    if a.setup:
+        install_chromium()
+        update_db()
+        print("\nInstallation terminée.")
+        return 0
     if a.update_db:
         update_db()
         if not a.ip:
             return 0
+    if not a.offline and maxminddb and not (find_mmdb("city") and find_mmdb("asn")):
+        print("Bases de géolocalisation DB-IP absentes : téléchargement (une seule fois) …")
+        update_db()
 
     print(f"\n=== {APP} {VERSION} ===")
     target = a.ip or input("Adresse IP à analyser : ")
