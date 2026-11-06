@@ -851,12 +851,45 @@ def shodan_internetdb(ip: str) -> dict:
 # --------------------------------------------------------------------------- #
 # Contacts : site web, mentions légales, schema.org, security.txt, RDAP domaine
 # --------------------------------------------------------------------------- #
+LEGAL_KEYWORDS = re.compile(
+    r"mentions|l[ée]gal|impressum|imprint|cr[ée]dits?|informations?-l[ée]gales|cgu|cgv|"
+    r"conditions|confidentialit|privacy|rgpd|gdpr|donn[ée]es-personnelles|cookies", re.I)
 CONTACT_KEYWORDS = re.compile(
-    r"contact|nous-?joindre|joindre|mentions|legal|l[ée]gales|impressum|imprint|a-?propos|about|"
-    r"support|aide|help|assistance|sav|service-?client|customer|status|statut|qui-sommes",
-    re.I)
-CONTACT_FALLBACK_PATHS = ["/contact", "/contact-us", "/nous-contacter", "/mentions-legales",
-                          "/legal", "/impressum", "/support", "/humans.txt"]
+    r"contact|nous-?joindre|joindre|a-?propos|about|qui-sommes|support|aide|help|assistance|"
+    r"sav|service-?client|customer|status|statut|plan-du-site|sitemap", re.I)
+CONTACT_FALLBACK_PATHS = ["/mentions-legales", "/mentions-legales/", "/mentions-legales.html",
+                          "/mentions", "/legal", "/legal-notice", "/informations-legales", "/credits",
+                          "/contact", "/contact/", "/nous-contacter", "/contact-us", "/impressum",
+                          "/humans.txt"]
+SITEMAP_PATHS = ["/sitemap.xml", "/sitemap_index.xml", "/wp-sitemap.xml", "/page-sitemap.xml"]
+
+# Rôles cités dans les mentions légales / crédits
+ROLE_PATTERNS = [
+    ("Créateur / prestataire web",
+     r"conception|cr[ée]ation|r[ée]alisation|d[ée]veloppe(?:ment|ur|use)|d[ée]velopp[ée]|webmaster|"
+     r"maintenance|int[ée]gration|web\s?design|graphisme|agence\s+web|prestataire(?:\s+technique)?|"
+     r"r[ée]alis[ée]\s+par|cr[ée]{2}\s+par|con[çc]u\s+par|made\s+(?:with\s.{1,12}\s)?by|"
+     r"designed\s+by|developed\s+by|website\s+by|site\s+by|cr[ée]dits?"),
+    ("Hébergeur", r"h[ée]berg(?:eur|ement|[ée]\s+par)|hosting|hosted\s+by|h[ée]bergeur\s+du\s+site"),
+    ("Éditeur", r"[ée]diteur|propri[ée]taire|[ée]dit[ée]\s+par|publisher|soci[ée]t[ée]\s+[ée]ditrice"),
+    ("Directeur de publication", r"(?:directeur|directrice|responsable)\s+(?:de\s+(?:la\s+)?)?publication"),
+    ("DPO / données personnelles", r"d[ée]l[ée]gu[ée]e?\s+[àa]\s+la\s+protection|\bDPO\b"),
+]
+_ROLE_PREFIX = r"^(?:[\W\d_]{0,4})(?:(?:ce\s+|le\s+|notre\s+)?(?:site|website|site\s+(?:web|internet))\s+(?:est\s+|a\s+[ée]t[ée]\s+)?)?"
+_ROLE_RX = [(name, re.compile(rf"{_ROLE_PREFIX}(?:{rx})", re.I)) for name, rx in ROLE_PATTERNS]
+# pied de page : « © 2024 X — Site réalisé par Agence Y » (n'importe où dans une ligne courte)
+_CREDIT_ANY = re.compile(r"(?:r[ée]alis[ée]|cr[ée]{2}|con[çc]u|d[ée]velopp[ée]|design[ée]?|made|built|"
+                         r"cr[ée]ation(?:\s+(?:du\s+)?site)?(?:\s+(?:web|internet))?|webdesign|propuls[ée])"
+                         r"\s*(?:avec\s+\S+\s+)?(?:par|by|:)", re.I)
+_URL_MARK = re.compile(r"⟨([^⟩]+)⟩")
+BIG_PLATFORMS = ("google.", "facebook.", "linkedin.", "twitter.", "x.com", "instagram.", "youtube.",
+                 "wordpress.org", "w3.org", "cnil.fr", "legifrance", "europa.eu", "apple.com",
+                 "microsoft.com", "mozilla.org", "gouv.fr", "service-public.fr", "schema.org",
+                 "openstreetmap", "tripadvisor", "booking.com", "pinterest.", "tiktok.",
+                 "unsplash", "pexels", "freepik", "shutterstock", "adobe.", "istockphoto", "flaticon",
+                 "fontawesome", "wix.com", "squarespace", "shopify", "jimdo", "webflow", "godaddy",
+                 "ovh.", "ovhcloud", "ionos", "o2switch", "hostinger", "gandi.net", "amazon.",
+                 "cloudflare", "elementor", "wpengine", "planethoster", "infomaniak", "scaleway")
 SOCIAL = {"linkedin.com": "LinkedIn", "twitter.com": "X / Twitter", "x.com": "X / Twitter",
           "facebook.com": "Facebook", "instagram.com": "Instagram", "youtube.com": "YouTube",
           "github.com": "GitHub", "t.me": "Telegram", "wa.me": "WhatsApp", "tiktok.com": "TikTok"}
@@ -963,7 +996,7 @@ def _jsonld_contacts(body: str) -> list[dict]:
 
 def _extract_page_contacts(url: str, body: str) -> dict:
     out = {"emails": set(), "phones": set(), "social": {}, "form": False, "jsonld": [],
-           "links": [], "title": None}
+           "all_links": [], "title": None}
     m = re.search(r"(?is)<title[^>]*>(.*?)</title>", body)
     if m:
         out["title"] = " ".join(html.unescape(m.group(1)).split())[:120]
@@ -991,48 +1024,207 @@ def _extract_page_contacts(url: str, body: str) -> dict:
             if host == dom or host.endswith("." + dom):
                 out["social"].setdefault(name, absu)
         lab = " ".join(re.sub(r"<[^>]+>", " ", label).split())[:60]
-        if absu.startswith("http") and (CONTACT_KEYWORDS.search(urllib.parse.urlparse(absu).path)
-                                        or CONTACT_KEYWORDS.search(lab)):
-            out["links"].append((absu, lab))
+        if absu.startswith("http"):
+            out["all_links"].append((absu, lab))
     out["form"] = bool(re.search(r"(?is)<form\b.*?<textarea", body))
     out["jsonld"] = _jsonld_contacts(body)
     return out
 
 
-def site_contacts(ip: str, h: dict) -> dict:
-    """Explore la page d'accueil et les pages contact / mentions légales du site."""
-    ctx = _LEGACY if h.get("legacy_tls") else _INSECURE
-    direct = not h.get("via_proxy")
-    pin = (h["sni"], ip) if h.get("sni") and direct else None
-    start = h.get("final_url") or h["url"]
+def _html_lines(body: str, base: str) -> list[str]:
+    """Texte de la page découpé par blocs, liens conservés sous la forme « texte ⟨url⟩ »."""
+    t = re.sub(r"(?is)<(script|style|noscript|svg|head)[^>]*>.*?</\1>", " ", body)
+
+    def anchor(m):
+        href = html.unescape(m.group(1).strip())
+        return f" {m.group(2)} ⟨{urllib.parse.urljoin(base, href)}⟩ "
+    t = re.sub(r'(?is)<a\b[^>]*?href\s*=\s*["\']([^"\']+)["\'][^>]*>(.*?)</a>', anchor, t)
+    t = re.sub(r"(?i)<br\s*/?>|</(?:p|div|li|h[1-6]|tr|section|article|footer|header|dt|dd|td|ul|ol|"
+               r"strong|b)>|<(?:h[1-6]|p|li|dt|dd|tr|strong|b)\b[^>]*>", "\n", t)
+    t = re.sub(r"(?s)<[^>]+>", " ", t)
+    t = html.unescape(t)
+    t = re.sub(r"\s*[\[\(\{]\s*(?:at|arobase)\s*[\]\)\}]\s*|\s+arobase\s+", "@", t, flags=re.I)
+    t = re.sub(r"\s*[\[\(\{]\s*(?:dot|point)\s*[\]\)\}]\s*", ".", t, flags=re.I)
+    lines = [re.sub(r"[ \t\xa0\u200b]+", " ", ln).strip(" \t-–—|•·") for ln in t.split("\n")]
+    return [ln for ln in lines if ln]
+
+
+def _block_contacts(text: str) -> dict:
+    emails, phones, urls = [], [], []
+    for u in _URL_MARK.findall(text):
+        if u.lower().startswith("mailto:"):
+            e = _clean_email(urllib.parse.unquote(u[7:].split("?")[0]))
+            if e and e not in emails:
+                emails.append(e)
+        elif u.lower().startswith("tel:"):
+            ph = _clean_phone(urllib.parse.unquote(u[4:]))
+            if ph and ph not in phones:
+                phones.append(ph)
+        elif u.startswith("http") and u not in urls:
+            urls.append(u)
+    plain = _URL_MARK.sub(" ", text)
+    for e in _EMAIL_RX.findall(plain):
+        e = _clean_email(e)
+        if e and e not in emails:
+            emails.append(e)
+    for ph in _PHONE_RX.findall(plain):
+        ph = _clean_phone(ph)
+        if ph and _phone_key(ph) not in [_phone_key(x) for x in phones]:
+            phones.append(ph)
+    for u in re.findall(r"\b(?:https?://|www\.)[\w.-]+\.[a-z]{2,}(?:/[^\s,;)]*)?", plain, re.I):
+        u = u if u.startswith("http") else "https://" + u
+        if u not in urls:
+            urls.append(u)
+    return {"emails": emails, "phones": phones, "urls": urls}
+
+
+def _role_name(rest: str) -> str | None:
+    rest = _URL_MARK.sub(" ", rest)
+    rest = re.sub(r"^[\s:：\-–—]+", "", rest)
+    rest = re.split(r"\s*(?:[,;|\n]|\s[-–—]\s|\(|\s(?:SAS|SARL|SA|EURL|SASU)\b.*)", rest)[0].strip(" .:")
+    rest = re.sub(r"(?i)^(?:le\s+site\s+(?:est\s+)?|est\s+|par\s+|by\s+|la\s+soci[ée]t[ée]\s+|"
+                  r"l['’]agence\s+|du\s+site\s*:?\s*)+", "", rest).strip(" .:")
+    if not rest or len(rest) > 80 or len(rest) < 2 or "@" in rest or re.fullmatch(r"[\d\s+.()]+", rest):
+        return None
+    return rest
+
+
+def extract_roles(url: str, body: str, legal_page: bool) -> list[dict]:
+    """Repère créateur / webmaster / hébergeur / éditeur… et leurs coordonnées."""
+    lines = _html_lines(body, url)
+    roles = []
+    i = 0
+    while i < len(lines):
+        ln = lines[i]
+        role = next((name for name, rx in _ROLE_RX if rx.search(ln)), None)
+        if not role and not legal_page and len(ln) <= 160 and _CREDIT_ANY.search(ln):
+            role = "Créateur / prestataire web"
+        short_line = len(_URL_MARK.sub("", ln)) <= (300 if legal_page else 160)
+        if not role or not short_line:
+            i += 1
+            continue
+        if not legal_page and role != "Créateur / prestataire web":
+            i += 1
+            continue
+        if role == "Créateur / prestataire web" and re.search(
+                r"photo|image|illustr|ic[oô]ne|vid[ée]o|polices?\b|fonts?\b|musique|carte|map", ln, re.I):
+            i += 1
+            continue
+        # le texte qui suit le libellé, puis quelques lignes tant qu'on ne tombe pas sur un autre rôle
+        m = re.search(r"[:：]\s*(.*)$", ln)
+        if re.search(r"\b(?:par|by)\b", ln, re.I) and not (m and len(m.group(1)) > 3 and
+                                                           not re.search(r"\b(?:par|by)\b", m.group(1), re.I)):
+            rest = re.sub(r"^.*?\b(?:par|by)\b", "", ln, flags=re.I)
+        else:
+            rest = m.group(1) if m else ""
+        block = [ln]
+        j = i + 1
+        while legal_page and j < len(lines) and j <= i + 5:
+            if any(rx.search(lines[j]) for _, rx in _ROLE_RX) or len(lines[j]) > 300:
+                break
+            block.append(lines[j])
+            if not rest:
+                rest = lines[j]
+            j += 1
+        text = "\n".join(block)
+        c = _block_contacts(text)
+        name = _role_name(rest) or (_role_name(_URL_MARK.sub(" ", block[1])) if len(block) > 1 else None)
+        if not legal_page and not c["urls"]:
+            i += 1
+            continue
+        if name or c["emails"] or c["phones"] or c["urls"]:
+            roles.append({"role": role, "name": name, "source": url, "excerpt": text[:400], **c})
+        i = j if legal_page else i + 1
+    # fusion des doublons (même rôle + même nom)
+    merged: dict = {}
+    for r_ in roles:
+        key = (r_["role"], (r_["name"] or "").lower() or tuple(r_["urls"][:1]) or tuple(r_["emails"][:1]))
+        if key in merged:
+            for k in ("emails", "phones", "urls"):
+                merged[key][k] += [x for x in r_[k] if x not in merged[key][k]]
+        else:
+            merged[key] = r_
+    return list(merged.values())
+
+
+def _sitemap_urls(get_raw, origin: str, limit: int = 400) -> list[str]:
+    found: list[str] = []
+    queue = [origin + p for p in SITEMAP_PATHS]
+    seen = set()
+    while queue and len(seen) < 6:
+        u = queue.pop(0)
+        if u in seen:
+            continue
+        seen.add(u)
+        txt = safe(get_raw, u)
+        if not isinstance(txt, str) or "<loc>" not in txt:
+            continue
+        locs = [html.unescape(x.strip()) for x in re.findall(r"<loc>\s*([^<]+?)\s*</loc>", txt)]
+        if "<sitemapindex" in txt:
+            locs.sort(key=lambda x: 0 if re.search(r"page", x, re.I) else 1)
+            queue += locs[:3]
+        else:
+            found += locs
+        if len(found) >= limit:
+            break
+    return found
+
+
+def crawl_contacts(start: str, max_pages: int = 9, fetch_kw: dict | None = None,
+                   legal_first: bool = True) -> dict:
+    """Page d'accueil + pages légales/contact (liens, sitemap, chemins usuels)."""
+    fetch_kw = dict(fetch_kw or {})
     origin = "{0.scheme}://{0.netloc}".format(urllib.parse.urlparse(start))
-    base_dom = registered_domain(urllib.parse.urlparse(start).hostname) or urllib.parse.urlparse(start).hostname
+    host0 = urllib.parse.urlparse(start).hostname or ""
+    base_dom = registered_domain(host0) or host0
+
+    def get_raw(u):
+        r = fetch(u, verify=False, timeout=6, max_bytes=2_000_000, **fetch_kw)
+        if r.status != 200:
+            return None
+        return r.text
 
     def get(u):
-        r = fetch(u, verify=False, direct=direct, context=ctx, pin=pin, timeout=6, max_bytes=2_000_000)
+        r = fetch(u, verify=False, timeout=6, max_bytes=2_000_000, **fetch_kw)
         ct = r.headers.get("Content-Type", r.headers.get("content-type", ""))
         if r.status != 200 or not ("html" in ct or "text" in ct or not ct):
             return None
         return r.url, r.text
 
-    pages = []
+    def same_site(u):
+        hst = urllib.parse.urlparse(u).hostname or ""
+        return (registered_domain(hst) or hst) == base_dom
+
+    pages: list[tuple] = []  # (url, body, contacts)
     first = safe(get, start)
     if isinstance(first, tuple):
-        pages.append((first[0], _extract_page_contacts(*first)))
-    # pages candidates : liens de la page d'accueil, puis chemins usuels
-    cand = []
-    if pages:
-        for u, lab in pages[0][1]["links"]:
-            hst = urllib.parse.urlparse(u).hostname or ""
-            if (registered_domain(hst) or hst) == base_dom and u.split("#")[0] not in cand:
-                cand.append(u.split("#")[0])
-    cand = cand[:6]
-    if len(cand) < 3:
-        cand += [origin + p for p in CONTACT_FALLBACK_PATHS if origin + p not in cand][:5]
+        pages.append((first[0], first[1], _extract_page_contacts(*first)))
+        origin = "{0.scheme}://{0.netloc}".format(urllib.parse.urlparse(first[0]))
+    links = pages[0][2]["all_links"] if pages else []
+    legal = [u for u, lab in links if same_site(u) and (LEGAL_KEYWORDS.search(u) or LEGAL_KEYWORDS.search(lab))]
+    contact = [u for u, lab in links if same_site(u) and (CONTACT_KEYWORDS.search(urllib.parse.urlparse(u).path)
+                                                          or CONTACT_KEYWORDS.search(lab))]
+    # priorité aux mentions légales / crédits
+    legal.sort(key=lambda u: 0 if re.search(r"mention|l[ée]gal|cr[ée]dit|impressum", u, re.I) else 1)
+    cand: list[str] = []
+    for u in (legal + contact) if legal_first else (contact + legal):
+        u = u.split("#")[0]
+        if u not in cand and u.rstrip("/") != (pages[0][0].rstrip("/") if pages else ""):
+            cand.append(u)
+    if not any(re.search(r"mention|l[ée]gal|cr[ée]dit|impressum", u, re.I) for u in cand):
+        sm = _sitemap_urls(get_raw, origin)
+        extra = [u for u in sm if same_site(u) and (LEGAL_KEYWORDS.search(u) or CONTACT_KEYWORDS.search(u))]
+        extra.sort(key=lambda u: 0 if re.search(r"mention|l[ée]gal|cr[ée]dit", u, re.I) else 1)
+        cand = extra[:4] + [u for u in cand if u not in extra]
+        if not any(re.search(r"mention|l[ée]gal|cr[ée]dit|impressum", u, re.I) for u in cand):
+            cand += [origin + p for p in CONTACT_FALLBACK_PATHS if origin + p not in cand]
+    cand = cand[:max_pages + 6]
     with cf.ThreadPoolExecutor(max_workers=4) as ex:
         for u, res in zip(cand, ex.map(lambda u: safe(get, u), cand)):
+            if len(pages) >= max_pages:
+                break
             if isinstance(res, tuple) and res[0] not in [x[0] for x in pages]:
-                pages.append((res[0], _extract_page_contacts(*res)))
+                pages.append((res[0], res[1], _extract_page_contacts(*res)))
 
     items, seen = [], set()
 
@@ -1047,7 +1239,8 @@ def site_contacts(ip: str, h: dict) -> dict:
         seen.add(key)
         items.append({"kind": kind, "value": value, "source": src, "label": label})
 
-    for url, c in pages:
+    roles = []
+    for url, body, c in pages:
         short = urllib.parse.urlparse(url).path or "/"
         for j in c["jsonld"]:
             add(j["kind"], j["value"], f"données structurées ({short})", j.get("label"))
@@ -1057,19 +1250,71 @@ def site_contacts(ip: str, h: dict) -> dict:
             add("téléphone", ph, short)
         if c["form"]:
             add("formulaire", url, short, c["title"])
+        is_legal = bool(LEGAL_KEYWORDS.search(url) or LEGAL_KEYWORDS.search(c["title"] or ""))
+        roles += extract_roles(url, body, is_legal)
+    merged: dict = {}
+    for ro in roles:
+        key = (ro["role"], (ro["name"] or "").lower() or tuple(ro["urls"][:1]) or tuple(ro["emails"][:1]))
+        if key in merged:
+            for k in ("emails", "phones", "urls"):
+                merged[key][k] += [x for x in ro[k] if x not in merged[key][k]]
+            if LEGAL_KEYWORDS.search(ro["source"]):  # l'extrait des mentions légales est plus parlant
+                merged[key]["source"], merged[key]["excerpt"] = ro["source"], ro["excerpt"]
+        else:
+            merged[key] = dict(ro)
+    roles = list(merged.values())
     social = {}
-    for _, c in pages:
+    for _, _, c in pages:
         for k, v in c["social"].items():
             social.setdefault(k, v)
     for k, v in social.items():
         add("réseau social", v, "liens du site", k)
+    return {"origin": origin, "base_domain": base_dom, "pages": [u for u, _, _ in pages],
+            "items": items[:80], "roles": roles}
+
+
+def _developer_sites(roles: list[dict], site_domain: str) -> list[str]:
+    out = []
+    for r_ in roles:
+        if r_["role"] != "Créateur / prestataire web":
+            continue
+        for u in r_["urls"]:
+            host = (urllib.parse.urlparse(u).hostname or "").lower()
+            dom = registered_domain(host)
+            if not dom or dom == site_domain or any(b in host for b in BIG_PLATFORMS):
+                continue
+            home = f"https://{host}/"
+            if dom not in [registered_domain(urllib.parse.urlparse(x).hostname) for x in out]:
+                out.append(home)
+    return out[:2]
+
+
+def site_contacts(ip: str, h: dict) -> dict:
+    """Contacts du site analysé + contacts du prestataire web cité (créateur / webmaster)."""
+    ctx = _LEGACY if h.get("legacy_tls") else _INSECURE
+    direct = not h.get("via_proxy")
+    pin = (h["sni"], ip) if h.get("sni") and direct else None
+    start = h.get("final_url") or h["url"]
+    res = crawl_contacts(start, fetch_kw={"direct": direct, "context": ctx, "pin": pin})
     if h.get("security_txt"):
         for line in h["security_txt"].splitlines():
             m = re.match(r"\s*(Contact|Policy|Hiring)\s*:\s*(\S+)", line, re.I)
             if m:
-                add("sécurité", m.group(2).replace("mailto:", ""), "/.well-known/security.txt",
-                    m.group(1).capitalize())
-    return {"origin": origin, "pages": [u for u, _ in pages], "items": items[:60]}
+                res["items"].append({"kind": "sécurité", "value": m.group(2).replace("mailto:", ""),
+                                     "source": "/.well-known/security.txt",
+                                     "label": m.group(1).capitalize()})
+    # site du prestataire (agence / développeur) cité dans les mentions légales ou le pied de page
+    res["developers"] = []
+    for home in _developer_sites(res["roles"], res["base_domain"]):
+        log(f"Contacts du prestataire web : {home}")
+        dev = safe(crawl_contacts, home, 5, {}, False)
+        if ok(dev):
+            dev["items"] = [it for it in dev["items"] if it["kind"] in ("email", "téléphone", "formulaire", "adresse")]
+            dev["roles"] = []
+            res["developers"].append(dev)
+        else:
+            res["developers"].append({"origin": home, "_error": dev.get("_error")})
+    return res
 
 
 def rdap_domain(domain: str) -> dict:
@@ -1108,9 +1353,16 @@ def contact_summary(r: dict) -> dict:
     """Meilleur contact par usage : site, sécurité, domaine, hébergeur."""
     items = [it for c in r.get("contacts", {}).values() if ok(c) for it in c["items"]]
 
-    def best(kinds, prefer=r"contact|support|info|hello|bonjour|service|client|accueil|sav|help"):
-        cands = [it for it in items if it["kind"] in kinds]
-        cands.sort(key=lambda it: (not it["source"].startswith("données structurées"),
+    site_doms = {c.get("base_domain") for c in r.get("contacts", {}).values() if ok(c)}
+    role_vals = {v for c in r.get("contacts", {}).values() if ok(c) for ro in c.get("roles", [])
+                 if ro["role"] not in ("Éditeur", "Directeur de publication")
+                 for v in ro["emails"] + ro["phones"]}
+
+    def best(kinds, prefer=r"contact|support|info|hello|bonjour|service|client|accueil|sav|help|r[ée]serv"):
+        cands = [it for it in items if it["kind"] in kinds and it["value"] not in role_vals]
+        cands.sort(key=lambda it: (not (it["kind"] != "email" or it["value"].split("@")[-1] in site_doms
+                                        or registered_domain(it["value"].split("@")[-1]) in site_doms),
+                                   not it["source"].startswith("données structurées"),
                                    not re.search(prefer, it["value"], re.I)))
         return cands[0]["value"] if cands else None
 
@@ -1122,7 +1374,26 @@ def contact_summary(r: dict) -> dict:
                 reg_abuse = (e.get("emails") or e.get("phones"))[0]
                 break
     forms = [it["value"] for it in items if it["kind"] == "formulaire"]
-    return {"contact_email": best({"email"}), "contact_phone": best({"téléphone"}),
+    dev_name = host_name = None
+    dev_contacts: list[str] = []
+    for c in r.get("contacts", {}).values():
+        if not ok(c):
+            continue
+        for ro in c.get("roles", []):
+            if ro["role"] == "Créateur / prestataire web":
+                dev_name = dev_name or ro.get("name")
+                dev_contacts += [x for x in ro["emails"] + ro["phones"] if x not in dev_contacts]
+            if ro["role"] == "Hébergeur":
+                host_name = host_name or ro.get("name")
+        for d in c.get("developers", []):
+            if ok(d):
+                dev_name = dev_name or d["base_domain"]
+                ems = [it["value"] for it in d["items"] if it["kind"] == "email"]
+                tels = [it["value"] for it in d["items"] if it["kind"] == "téléphone"]
+                forms_d = [it["value"] for it in d["items"] if it["kind"] == "formulaire"]
+                dev_contacts += [x for x in ems + tels + forms_d[:1] if x not in dev_contacts]
+    return {"dev_name": dev_name, "dev_contacts": dev_contacts[:4], "host_name": host_name,
+            "contact_email": best({"email"}), "contact_phone": best({"téléphone"}),
             "contact_form": forms[0] if forms else None,
             "contact_security": best({"sécurité"}, r"@|mailto"),
             "contact_registrar": reg_abuse,
@@ -1381,7 +1652,14 @@ def render_contacts(r: dict) -> str:
              contact_link("téléphone", s["contact_phone"]) if s.get("contact_phone") else "",
              (f'formulaire : {contact_link("formulaire", s["contact_form"])}' if s.get("contact_form") else "")] if x),
          "contacts publiés par le site"),
-        ("Faille de sécurité", contact_link("sécurité", s["contact_security"]) if s.get("contact_security") else "",
+        ("Faille, maintenance technique (développeur / prestataire)",
+         "<br>".join(x for x in [
+             f"<b>{html.escape(s['dev_name'])}</b>" if s.get("dev_name") else "",
+             *[contact_link("email" if "@" in v else "url" if v.startswith("http") else "téléphone", v)
+               for v in s.get("dev_contacts", [])]] if x),
+         "mentions légales / crédits du site, puis site du prestataire"),
+        ("Faille de sécurité (contact officiel)",
+         contact_link("sécurité", s["contact_security"]) if s.get("contact_security") else "",
          "security.txt"),
         ("Abus, attaque, spam depuis cette IP", contact_link("email", s["abuse"]) if s.get("abuse") else "",
          "hébergeur — RDAP de l'adresse IP"),
@@ -1403,6 +1681,34 @@ def render_contacts(r: dict) -> str:
         body = ('<table class="grid"><thead><tr><th>Type</th><th>Coordonnée</th><th>Libellé</th>'
                 f'<th>Trouvé sur</th></tr></thead><tbody>{rows_}</tbody></table>') if rows_ else \
             '<p class="na">Aucune coordonnée publiée trouvée sur les pages explorées.</p>'
+        roles = c.get("roles", [])
+        if roles:
+            rrows = "".join(
+                f'<tr><td data-l="Rôle"><b>{html.escape(ro["role"])}</b></td>'
+                f'<td data-l="Nom">{E(ro.get("name"))}</td>'
+                f'<td data-l="Coordonnées">' + "<br>".join(
+                    [contact_link("email", e) for e in ro["emails"]]
+                    + [contact_link("téléphone", t) for t in ro["phones"]]
+                    + [contact_link("url", u) for u in ro["urls"][:3]]) + "</td>"
+                f'<td data-l="Trouvé sur">{html.escape(urllib.parse.urlparse(ro["source"]).path or "/")}'
+                f'<details><summary>extrait</summary><pre>{html.escape(_URL_MARK.sub(lambda m: "<" + m.group(1) + ">", ro["excerpt"]))}</pre></details></td></tr>'
+                for ro in roles)
+            out.append('<h4>Intervenants cités (mentions légales, crédits, pied de page)</h4>'
+                       '<table class="grid"><thead><tr><th>Rôle</th><th>Nom</th><th>Coordonnées</th>'
+                       f'<th>Trouvé sur</th></tr></thead><tbody>{rrows}</tbody></table>')
+        for d in c.get("developers", []):
+            if not ok(d):
+                out.append(f'<h4>Site du prestataire — {html.escape(d["origin"])}</h4>' + err(d))
+                continue
+            drows = "".join(
+                f'<tr><td data-l="Type">{html.escape(it["kind"])}</td>'
+                f'<td data-l="Coordonnée">{contact_link(it["kind"], it["value"])}</td>'
+                f'<td data-l="Libellé">{E(it.get("label"))}</td>'
+                f'<td data-l="Trouvé sur">{html.escape(it["source"])}</td></tr>' for it in d["items"])
+            out.append(f'<h4>Contacts du prestataire web — {html.escape(d["origin"])}</h4>' + (
+                '<table class="grid"><thead><tr><th>Type</th><th>Coordonnée</th><th>Libellé</th>'
+                f'<th>Trouvé sur</th></tr></thead><tbody>{drows}</tbody></table>' if drows else
+                '<p class="na">Aucune coordonnée trouvée sur le site du prestataire.</p>'))
         pages = "".join(f"<li>{html.escape(u)}</li>" for u in c["pages"])
         out.append(f'<h4>Coordonnées publiées par le site — {html.escape(c["origin"])}</h4>{body}'
                    f'<details><summary>Pages explorées ({len(c["pages"])})</summary><ul class="small">{pages}</ul></details>')
