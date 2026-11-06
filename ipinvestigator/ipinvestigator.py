@@ -137,6 +137,7 @@ def bootstrap() -> None:
 
 bootstrap()
 
+import http.client  # noqa: E402
 import http.cookiejar  # noqa: E402
 import urllib.error  # noqa: E402
 import urllib.parse  # noqa: E402
@@ -284,17 +285,81 @@ _INSECURE = ssl.create_default_context()
 _INSECURE.check_hostname = False
 _INSECURE.verify_mode = ssl.CERT_NONE
 
+# Contexte « ancien » : vieux serveurs n'acceptant que TLS 1.0/1.1 ou des chiffrements faibles
+_LEGACY = ssl.create_default_context()
+_LEGACY.check_hostname = False
+_LEGACY.verify_mode = ssl.CERT_NONE
+try:
+    _LEGACY.minimum_version = ssl.TLSVersion.TLSv1
+    _LEGACY.set_ciphers("DEFAULT:@SECLEVEL=0")
+except (ValueError, ssl.SSLError):
+    pass
+
+
+# Connexions « épinglées » : on parle au nom de site (SNI + en-tête Host) tout en se
+# connectant à l'IP analysée, comme un navigateur dont le DNS pointerait sur cette IP.
+class _PinHTTPConnection(http.client.HTTPConnection):
+    pin = None
+
+    def connect(self):
+        if self.pin and self.host == self.pin[0]:
+            self.sock = socket.create_connection((self.pin[1], self.port), self.timeout)
+        else:
+            super().connect()
+
+
+class _PinHTTPSConnection(http.client.HTTPSConnection):
+    pin = None
+
+    def connect(self):
+        if self.pin and self.host == self.pin[0]:
+            sock = socket.create_connection((self.pin[1], self.port), self.timeout)
+            self.sock = self._context.wrap_socket(sock, server_hostname=self.host)
+        else:
+            super().connect()
+
+
+class _PinHTTPHandler(urllib.request.HTTPHandler):
+    def __init__(self, pin):
+        super().__init__()
+        self.pin = pin
+
+    def http_open(self, req):
+        def make(host, **kw):
+            c = _PinHTTPConnection(host, **kw)
+            c.pin = self.pin
+            return c
+        return self.do_open(make, req)
+
+
+class _PinHTTPSHandler(urllib.request.HTTPSHandler):
+    def __init__(self, pin, context):
+        super().__init__(context=context)
+        self.pin = pin
+        self.ctx = context
+
+    def https_open(self, req):
+        def make(host, **kw):
+            c = _PinHTTPSConnection(host, **kw)
+            c.pin = self.pin
+            return c
+        return self.do_open(make, req, context=self.ctx)
+
 
 def fetch(url: str, timeout: float = TIMEOUT, verify: bool = True, direct: bool = False,
           headers: dict | None = None, jar=None, max_bytes: int = 5_000_000,
-          max_redirects: int = 10) -> Resp:
+          max_redirects: int = 10, pin: tuple | None = None, context=None) -> Resp:
     """GET avec suivi des redirections et cookies (bibliothèque standard uniquement).
     direct=True : connexion directe à la cible, sans le proxy du système."""
     jar = jar if jar is not None else http.cookiejar.CookieJar()
     hdrs = {"User-Agent": UA, "Accept-Language": "fr,en;q=0.8", "Accept": "*/*"}
     hdrs.update(headers or {})
-    handlers = [_NoRedirect(), urllib.request.HTTPCookieProcessor(jar),
-                urllib.request.HTTPSHandler(context=None if verify else _INSECURE)]
+    ctx = context or (None if verify else _INSECURE)
+    handlers = [_NoRedirect(), urllib.request.HTTPCookieProcessor(jar)]
+    if pin:
+        handlers += [_PinHTTPHandler(pin), _PinHTTPSHandler(pin, ctx)]
+    else:
+        handlers.append(urllib.request.HTTPSHandler(context=ctx))
     if direct:
         handlers.append(urllib.request.ProxyHandler({}))
     opener = urllib.request.build_opener(*handlers)
@@ -364,15 +429,21 @@ def reverse_dns(ip: str) -> dict:
 # --------------------------------------------------------------------------- #
 def tls_info(ip: str, port: int = 443, sni: str | None = None) -> dict:
     info: dict = {}
-    ctx = ssl.create_default_context()
-    ctx.check_hostname = False
-    ctx.verify_mode = ssl.CERT_NONE
-    with socket.create_connection((ip, port), timeout=TIMEOUT) as sock:
-        with ctx.wrap_socket(sock, server_hostname=sni or None) as s:
-            der = s.getpeercert(binary_form=True)
-            info["protocol"] = s.version()
-            c = s.cipher()
-            info["cipher"] = c[0] if c else None
+    der = None
+    for ctx in (_INSECURE, _LEGACY):
+        try:
+            with socket.create_connection((ip, port), timeout=TIMEOUT) as sock:
+                with ctx.wrap_socket(sock, server_hostname=sni or None) as s:
+                    der = s.getpeercert(binary_form=True)
+                    info["protocol"] = s.version()
+                    c = s.cipher()
+                    info["cipher"] = c[0] if c else None
+            break
+        except (ssl.SSLError, OSError):
+            if ctx is _LEGACY:
+                raise
+    if sni:
+        info["sni"] = sni
     info["sha256"] = hashlib.sha256(der).hexdigest().upper()
     try:
         from cryptography import x509
@@ -458,13 +529,45 @@ def parse_html(body: str) -> dict:
     return out
 
 
-def http_probe(ip: str, port: int, via_proxy: bool = False) -> dict:
+def _probe_attempts(ip: str, names: list[str], prefer_name: bool, tls: bool):
+    """Ordre des essais : (nom ou None, contexte TLS)."""
+    first = [names[0]] if (prefer_name and names) else []
+    order = first + [None] + [n for n in names if n not in first]
+    att = [(n, _INSECURE) for n in order]
+    if tls:
+        att += [(None, _LEGACY)] + ([(names[0], _LEGACY)] if names else [])
+    return att
+
+
+def http_probe(ip: str, port: int, via_proxy: bool = False, names: list[str] | None = None,
+               prefer_name: bool = False) -> dict:
     scheme = "https" if port in (443, 8443) else "http"
-    host = ip if port in (80, 443) else f"{ip}:{port}"
-    url = f"{scheme}://{host}/"
-    res: dict = {"url": url}
-    jar = http.cookiejar.CookieJar()
-    r = fetch(url, verify=False, direct=not via_proxy, jar=jar)
+    names = [n for n in (names or []) if n][:5]
+    res: dict = {}
+    errors = []
+    r = jar = None
+    for name, ctx in _probe_attempts(ip, names, prefer_name, scheme == "https"):
+        host = name or ip
+        netloc = host if port in (80, 443) else f"{host}:{port}"
+        url = f"{scheme}://{netloc}/"
+        jar = http.cookiejar.CookieJar()
+        try:
+            r = fetch(url, verify=False, direct=not via_proxy, jar=jar, context=ctx,
+                      pin=(name, ip) if (name and not via_proxy) else None)
+        except Exception as exc:  # noqa: BLE001
+            label = f"nom {name}" if name else "IP seule"
+            if ctx is _LEGACY:
+                label += ", TLS ancien"
+            errors.append(f"{label} : {getattr(exc, 'reason', exc)}")
+            continue
+        res["url"] = url
+        res["sni"] = name
+        res["legacy_tls"] = ctx is _LEGACY
+        ok_ctx, ok_pin = ctx, ((name, ip) if (name and not via_proxy) else None)
+        break
+    if r is None:
+        raise HttpError("le serveur refuse la connexion — essais : " + " | ".join(errors))
+    res["attempts_failed"] = errors
     if via_proxy:
         res["via_proxy"] = True
     res["status"] = r.status
@@ -504,14 +607,14 @@ def http_probe(ip: str, port: int, via_proxy: bool = False) -> dict:
     # robots.txt / security.txt
     for path, key in (("/robots.txt", "robots"), ("/.well-known/security.txt", "security_txt")):
         try:
-            rr = fetch(f"{scheme}://{host}{path}", verify=False, direct=not via_proxy, jar=jar,
-                       max_bytes=20000)
+            rr = fetch(res["url"].rstrip("/") + path, verify=False, direct=not via_proxy,
+                       jar=jar, max_bytes=20000, context=ok_ctx, pin=ok_pin)
             ok = rr.status == 200 and "<html" not in rr.text[:300].lower()
             res[key] = rr.text[:3000] if ok and rr.text.strip() else None
         except Exception:  # noqa: BLE001
             res[key] = None
     if scheme == "https":
-        res["tls"] = safe(tls_info, ip, port)
+        res["tls"] = safe(tls_info, ip, port, res.get("sni"))
     return res
 
 
@@ -540,7 +643,11 @@ def find_system_browser() -> str | None:
     return next((c for c in cands if c and os.path.isfile(c)), None)
 
 
-def screenshot_cli(url: str, path: str) -> dict:
+def _resolver_args(pin) -> list[str]:
+    return [f"--host-resolver-rules=MAP {pin[0]} {pin[1]}"] if pin else []
+
+
+def screenshot_cli(url: str, path: str, pin=None) -> dict:
     """Capture via le navigateur installé en mode headless (sans Playwright)."""
     import subprocess
     import tempfile
@@ -551,7 +658,8 @@ def screenshot_cli(url: str, path: str) -> dict:
         cmd = [exe, "--headless=new", "--disable-gpu", "--hide-scrollbars", "--no-first-run",
                "--ignore-certificate-errors", f"--user-data-dir={prof}",
                "--window-size=1366,850", "--virtual-time-budget=8000",
-               f"--user-agent={UA}", f"--screenshot={os.path.abspath(path)}", url]
+               f"--user-agent={UA}", *_resolver_args(pin),
+               f"--screenshot={os.path.abspath(path)}", url]
         if hasattr(os, "geteuid") and os.geteuid() == 0:
             cmd.insert(1, "--no-sandbox")
         if os.path.exists(path):
@@ -574,12 +682,14 @@ def screenshot_cli(url: str, path: str) -> dict:
     return {"path": path, "via": os.path.basename(exe)}
 
 
-def screenshot_playwright(url: str, path: str) -> dict:
+def screenshot_playwright(url: str, path: str, pin=None) -> dict:
     from playwright.sync_api import sync_playwright
     with sync_playwright() as p:
         exe = os.environ.get("IPINV_CHROMIUM")
         attempts = [{"executable_path": exe}] if exe else []
         attempts += [{}, {"channel": "msedge"}, {"channel": "chrome"}]
+        for kw in attempts:
+            kw["args"] = _resolver_args(pin)
         browser, last = None, None
         for kw in attempts:
             try:
@@ -590,7 +700,7 @@ def screenshot_playwright(url: str, path: str) -> dict:
         if browser is None:
             install_chromium()
             try:
-                browser = p.chromium.launch()
+                browser = p.chromium.launch(args=_resolver_args(pin))
             except Exception:  # noqa: BLE001
                 raise last
         try:
@@ -608,15 +718,15 @@ def screenshot_playwright(url: str, path: str) -> dict:
     return {"path": path, "via": "Playwright / Chromium"}
 
 
-def screenshot(url: str, path: str) -> dict:
+def screenshot(url: str, path: str, pin=None) -> dict:
     try:
         import playwright  # noqa: F401
     except ImportError:
-        return screenshot_cli(url, path)
+        return screenshot_cli(url, path, pin)
     try:
-        return screenshot_playwright(url, path)
+        return screenshot_playwright(url, path, pin)
     except Exception:  # noqa: BLE001
-        return screenshot_cli(url, path)
+        return screenshot_cli(url, path, pin)
 
 
 # --------------------------------------------------------------------------- #
@@ -838,7 +948,7 @@ def analyse(r: dict) -> dict:
 # Orchestration
 # --------------------------------------------------------------------------- #
 def investigate(ip: str, ports: list[int], out_dir: str, do_shot: bool = True,
-                offline: bool = False) -> dict:
+                offline: bool = False, hostname: str | None = None) -> dict:
     started = now_utc()
     stamp = started.strftime("%Y%m%d-%H%M%S")
     cap_dir = os.path.join(out_dir, "captures")
@@ -846,7 +956,7 @@ def investigate(ip: str, ports: list[int], out_dir: str, do_shot: bool = True,
 
     r: dict = {"ip": ip, "generated": started.strftime("%Y-%m-%d %H:%M UTC"),
                "stamp": stamp, "ports": ports, "app": f"{APP} {VERSION}",
-               "mode": "actif" if ports else "passif"}
+               "mode": "actif" if ports else "passif", "hostname": hostname}
 
     with cf.ThreadPoolExecutor(max_workers=8) as ex:
         log(f"Scan des ports {', '.join(map(str, ports))} …")
@@ -872,12 +982,17 @@ def investigate(ip: str, ports: list[int], out_dir: str, do_shot: bool = True,
         for p in ports:
             log(f"Port {p} : {r['scan'][p]['state']}")
         log("Analyse HTTP/HTTPS …" if open_ports else "Aucun port web ouvert.")
-        f_http = {p: ex.submit(safe, http_probe, ip, p) for p in open_ports}
+        # Noms de site candidats (SNI / Host) : domaine saisi, noms vus par Shodan, DNS inverse
+        sh_names = r["shodan"].get("hostnames", []) if ok(r["shodan"]) else []
+        names = list(dict.fromkeys(n for n in [hostname] + sh_names + [r["rdns"].get("hostname")]
+                                   if n and "*" not in n))[:5]
+        f_http = {p: ex.submit(safe, http_probe, ip, p, False, names, bool(hostname))
+                  for p in open_ports}
         # Réseau d'entreprise : connexion directe bloquée mais proxy disponible
         if not offline and _system_proxy():
             for p in ports:
                 if p not in open_ports:
-                    f_http[p] = ex.submit(safe, http_probe, ip, p, True)
+                    f_http[p] = ex.submit(safe, http_probe, ip, p, True, names, bool(hostname))
         asn = pick((r["geo_local"] or {}).get("asn"), (r["geo_online"] or {}).get("asn"))
         f_pdb = ex.submit(safe, peeringdb, int(asn)) if (asn and not offline) else None
         r["http"] = {p: f.result() for p, f in f_http.items()}
@@ -899,7 +1014,8 @@ def investigate(ip: str, ports: list[int], out_dir: str, do_shot: bool = True,
                 continue
             log(f"Capture d'écran du port {p} …")
             path = os.path.join(cap_dir, f"{ip}-{p}-{stamp}.png")
-            res = safe(screenshot, h["url"], path)
+            pin = (h["sni"], ip) if h.get("sni") and not h.get("via_proxy") else None
+            res = safe(screenshot, h["url"], path, pin)
             if ok(res) and os.path.exists(path):
                 with open(path, "rb") as fh:
                     res["b64"] = base64.b64encode(fh.read()).decode()
@@ -1111,6 +1227,10 @@ def render_html(r: dict) -> str:
                                   for c in h["cookies"])
             items = [
                 ("URL", E(h["url"])),
+                ("Nom de site utilisé (SNI / Host)",
+                 E(h.get("sni")) + (" " + badge("TLS ancien", "warn") if h.get("legacy_tls") else "")
+                 if h.get("sni") or h.get("legacy_tls") else '<span class="na">aucun (IP seule)</span>'),
+                ("Essais refusés", "<br>".join(html.escape(x) for x in h.get("attempts_failed", []))),
                 ("Réponse", E(f"{h['status']} {h['reason']}")),
                 ("Redirections", "<br>".join(html.escape(x) for x in h["redirects"])),
                 ("URL finale", E(h["final_url"])),
@@ -1311,15 +1431,23 @@ def parse_ports(text: str) -> list[int]:
     return ports or [80, 443]
 
 
-def resolve_target(target: str) -> str:
+def resolve(target: str) -> tuple[str, str | None]:
+    """Renvoie (ip, nom de domaine saisi ou None)."""
     target = target.strip()
     target = re.sub(r"^\w+://", "", target).split("/")[0]
+    if target.count(":") == 1:  # « hote:port »
+        target = target.split(":")[0]
+    target = target.strip("[]")
     try:
-        return str(ipaddress.ip_address(target))
+        return str(ipaddress.ip_address(target)), None
     except ValueError:
         ip = socket.gethostbyname(target)  # accepte aussi un nom de domaine
         print(f"  {target} → {ip}")
-        return ip
+        return ip, target.lower()
+
+
+def resolve_target(target: str) -> str:
+    return resolve(target)[0]
 
 
 def main(argv=None) -> int:
@@ -1350,7 +1478,7 @@ def main(argv=None) -> int:
     print(f"\n=== {APP} {VERSION} ===")
     target = a.ip or input("Adresse IP à analyser : ")
     try:
-        ip = resolve_target(target)
+        ip, hostname = resolve(target)
     except (OSError, ValueError):
         print(f"Adresse invalide : {target!r}")
         return 2
@@ -1360,7 +1488,8 @@ def main(argv=None) -> int:
         print("  (adresse privée : les sources Internet ne renverront rien d'utile)")
 
     print(f"\nAnalyse de {ip}\n")
-    r = investigate(ip, ports, a.out, do_shot=not a.no_screenshot, offline=a.offline)
+    r = investigate(ip, ports, a.out, do_shot=not a.no_screenshot, offline=a.offline,
+                    hostname=hostname)
 
     base = save_report(r, a.out)
 

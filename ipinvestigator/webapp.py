@@ -44,14 +44,14 @@ def run_job(job: dict, target: str, ports: list[int], shot: bool) -> None:
     inv.set_log_sink(sink)
     try:
         sink(f"Cible : {target}")
-        ip = inv.resolve_target(target)
-        if ip != target:
-            sink(f"{target} → {ip}")
+        ip, hostname = inv.resolve(target)
+        if hostname:
+            sink(f"{hostname} → {ip}")
         job["ip"] = ip
         ipobj = inv.ipaddress.ip_address(ip)
         if ipobj.is_private or ipobj.is_loopback:
             sink("Adresse privée : les sources Internet ne renverront rien d'utile")
-        r = inv.investigate(ip, ports, OUT_DIR, do_shot=shot)
+        r = inv.investigate(ip, ports, OUT_DIR, do_shot=shot, hostname=hostname)
         sink("Génération du rapport …")
         base = inv.save_report(r, OUT_DIR)
         s = r["summary"]
